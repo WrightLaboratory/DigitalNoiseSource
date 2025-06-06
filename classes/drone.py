@@ -41,10 +41,10 @@ from mpl_toolkits import mplot3d
 import pandas
 
 ## Import packages from our own module:
-import beamcals.plotting_utils as pu
-import beamcals.fitting_utils as fu
-import beamcals.geometry_utils as gu
-import beamcals.time_utils as tu
+sys.path.insert(0, '../classes/')
+import fitting_utils as fu
+import geometry_utils as gu
+import time_utils as tu
 
 class Drone_Data:
     def __init__(self,Drone_Directory,FLYTAG,site_class,tlb=0,tub=-1,ignore_rtk=False):
