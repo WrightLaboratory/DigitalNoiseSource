@@ -26,13 +26,14 @@ from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
 
 ## Import packages from our own module:
-from beamcals import corr
-from beamcals import drone
-from beamcals import bicolog
-import beamcals.plotting_utils as pu
-import beamcals.fitting_utils as fu
-import beamcals.geometry_utils as gu
-import beamcals.time_utils as tu
+sys.path.insert(0, '../classes/')
+import corr, concat, drone
+import plotting_utils as pu
+import fitting_utils as fu
+import geometry_utils as gu
+import time_utils as tu
+import site_utils as si
+
 ## What could go wrong? ...
 from beamcals import concat
 
