@@ -1,16 +1,17 @@
 flight_info:
     flights: ['Apr-12th-2025-03-19PM-Flight-Airdata.csv','Apr-12th-2025-03-27PM-Flight-Airdata.csv','Apr-12th-2025-03-50PM-Flight-Airdata.csv',
-                'Apr-12th-2025-03-58PM-Flight-Airdata.csv']
-    tlbs: [2650,400,400,250]
-    tubs: [2950,3700,1900,700]
+                'Apr-12th-2025-03-58PM-Flight-Airdata.csv','Apr-12th-2025-04-03PM-Flight-Airdata.csv']
+    desc: ['manual', '0.1mps', '1mps', '2.5mps', '5mps']
+    tlbs: [2650,400,400,250,250]
+    tubs: [2950,3700,1900,700,600]
     cdats: ['manual_and_0.1_pass/','manual_and_0.1_pass/','20250412T194037Z_WVUc52/corr/20250412T194134Z/',
-                '20250412T194037Z_WVUc52/corr/20250412T194134Z/']
-    fmaxes: ['None','None','None','None]
-    pols: ['N','N','N','N']
-    attns: [0,0,0,0]
-    tclbs: [18000,17000,0,0]
-    tcubs: [32500,35000,35000,35000]
-    masks: ['None','None','None','None']
+                '20250412T194037Z_WVUc52/corr/20250412T194134Z/','20250412T194037Z_WVUc52/corr/20250412T194134Z/']
+    fmaxes: ['None','None','None','None','None']
+    pols: ['N','N','N','N','N']
+    attns: [0,0,0,0,0]
+    tclbs: [18000,22300,16700,26600,33700]
+    tcubs: [32500,30300,20500,2800,-1]
+    masks: ['None','None','None','None','None']
 
 flag_info:
     N_pols: [1,3,11,15]
