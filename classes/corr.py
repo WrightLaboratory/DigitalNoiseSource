@@ -29,11 +29,19 @@ import datetime
 import pytz
 
 class Corr_Data:
-    def __init__(self,Data_Directory,Gain_Directory,site_class,Data_File_Index=None,Load_Gains=True,Fix_Gains=False,Apply_Gains=True,Gain_Params=[1.0,24.0],fbounds=[0,1024],use_ctime=False,crossmap=None,esystem=False):
+    def __init__(self,Data_Directory,Gain_Directory,site_class,
+                 Data_File_Index=[0,-1],Load_Gains=True,Fix_Gains=False,
+                 Apply_Gains=True,Gain_Params=[1.0,24.0],
+                 fbounds=[0,1024],use_ctime=False,
+                 crossmap=[],esystem=False):
         ## Get data files using os instead of git:
         self.Data_Directory=Data_Directory
         self.Gain_Directory=Gain_Directory
-        self.filenames=np.sort([x for x in os.listdir(self.Data_Directory) if ".lock" not in x])[:-1]
+        
+        filelist = np.sort([x for x in os.listdir(self.Data_Directory) if ".lock" not in x])[:-1]
+        self.filenames=filelist[Data_File_Index[0]:Data_File_Index[1]]
+        n_files = len(self.filenames)
+        
         print('Initializing Correlator Class using:')
         print("  --> "+self.Data_Directory)
         ## Load first data file to get array dimensions for V,t,f,prod:
@@ -49,11 +57,13 @@ class Corr_Data:
                 Cevecs=np.abs(np.array(fd['evec'][:,0,:,:]).transpose(2,0,1))**2.0
                 vis=Cevals*Cevecs
             else:
-                vis=np.array(fd['vis']).transpose(2,0,1)[:,flb:fub,:]
+                vis=np.array(fd['vis']).transpose(2,0,1)[:,flb:fub,:]   
         if use_ctime==False:
             self.t0=1e-9*fd['index_map']['time']['irigb_time'][0]
         if use_ctime==True:
             self.t0=fd['index_map']['time']['ctime'][0]
+            corrtoff = (2.56e-6)*fd['index_map']['time']['fpga_count'][0]
+            
         self.freq=np.array([i[0] for i in fd['index_map']['freq'][flb:fub]]) # frequency axis
         self.prod=fd['index_map']['prod'][:] # product axis
         self.n_channels=min(len(site_class.chmap),int(fd['index_map']['prod'][:][-1][0]+1))
@@ -64,13 +74,11 @@ class Corr_Data:
         prodmat=np.array([element for tupl in self.prod for element in tupl]).reshape(len(self.prod),2)
         for i,j in enumerate(self.chmap):
             self.automap[i]=np.intersect1d(np.where(prodmat[:,0]==j),np.where(prodmat[:,1]==j))
-        if Data_File_Index is None:
-            Data_File_Index=np.arange(len(self.filenames)).astype(int)
         ## Initialize Visibility and Time data products:
-        self.V=np.zeros((len(Data_File_Index),vis.shape[0],vis.shape[1],self.n_channels))
-        self.t=np.zeros((len(Data_File_Index),vis.shape[0]))
-        self.sat=np.zeros((len(Data_File_Index),vis.shape[0],vis.shape[1],self.n_channels))
-        self.V_cross=np.zeros((len(Data_File_Index),vis.shape[0],vis.shape[1],len(self.crossmap))).astype(complex)
+        self.V=np.zeros((n_files,vis.shape[0],vis.shape[1],self.n_channels))
+        self.t=np.zeros((n_files,vis.shape[0]))
+        self.sat=np.zeros((n_files,vis.shape[0],vis.shape[1],self.n_channels))
+        self.V_cross=np.zeros((n_files,vis.shape[0],vis.shape[1],len(self.crossmap))).astype(complex)
         # Get gain file (for all data files) if it exists...
         if Load_Gains==True:
             self.gainfile=os.listdir(self.Gain_Directory)[0]
@@ -96,10 +104,10 @@ class Corr_Data:
         ## Loop over all files to populate V_full,t_full
         print("  --> Arrays initialized with shape {}".format(self.V.shape))
         print("Assigning array values by reading in data files:")
-        for i,file in enumerate(self.filenames[Data_File_Index]):
+        for i,file in enumerate(self.filenames):
             try:
                 print("\r  --> Loading File: {}/{}".format(self.filenames[i],self.filenames[-1]),end="")
-                fd_n=h5py.File(self.Data_Directory+self.filenames[Data_File_Index[i]], 'r')
+                fd_n=h5py.File(self.Data_Directory+file, 'r')
                 vis=fd_n['vis'][:,flb:fub,:] # Visibility matrix
                 if 'CHIME' in site_class.name:
                     if esystem==True:
@@ -109,14 +117,11 @@ class Corr_Data:
                         vis=Cevals*Cevecs
                     else:
                         vis=np.array(fd_n['vis']).transpose(2,0,1)[:,flb:fub,:]
-                if use_ctime==False:
+                #construct deltatime from fpga_counts since start of file
+                tm=(2.56e-6)*np.array(fd_n['index_map']['time']['fpga_count']) - corrtoff
+                if use_ctime==False: # instead use irigtime
                    tm=np.array(fd_n['index_map']['time']['irigb_time']) # time axis
-                   if 'GBO' in site_class.name:
-                        tm=(2.56e-6)*np.array(fd_n['index_map']['time']['fpga_count']) #construct time from fpga_counts
-                if use_ctime==True:
-                   tm=np.array(fd_n['index_map']['time']['ctime']) # time axis
-                   if 'WLC' in site_class.name:
-                       tm=(2.56e-6)*np.array(fd_n['index_map']['time']['fpga_count']) #construct time from fpga_counts
+                   
                 freq=np.array([i[0] for i in fd_n['index_map']['freq'][flb:fub]]) # frequency axis
                 prod=fd_n['index_map']['prod'][:] # product axis
                 ## gain calibrate visibilities:
@@ -138,24 +143,16 @@ class Corr_Data:
                 print('\nSkipping file: {}'.format(file))    
         print("\n  --> Finished. Reshaping arrays.")
         ## reshape these arrays
-        self.V=self.V.reshape((len(Data_File_Index)*vis.shape[0],vis.shape[1],self.n_channels))
-        self.V_cross=self.V_cross.reshape((len(Data_File_Index)*vis.shape[0],vis.shape[1],len(self.crossmap)))
-        self.t=self.t.reshape(len(Data_File_Index)*vis.shape[0])
-        self.sat=self.sat.reshape((len(Data_File_Index)*vis.shape[0],vis.shape[1],self.n_channels))
-        if 'GBO' in site_class.name:
-            timedeltas=np.array([datetime.timedelta(seconds=x) for x in self.t])
-            dt0=datetime.datetime.fromtimestamp(self.t0,pytz.timezone('America/Montreal')).astimezone(pytz.utc)
-            self.t_arr_datetime=dt0+timedeltas
-        elif 'CHIME' in site_class.name:
+        self.V=self.V.reshape((n_files*vis.shape[0],vis.shape[1],self.n_channels))
+        self.V_cross=self.V_cross.reshape((n_files*vis.shape[0],vis.shape[1],len(self.crossmap)))
+        self.t=self.t.reshape(n_files*vis.shape[0])
+        self.sat=self.sat.reshape((n_files*vis.shape[0],vis.shape[1],self.n_channels))
+
+        timedeltas=np.array([datetime.timedelta(seconds=x) for x in self.t])
+        dt0=datetime.datetime.fromtimestamp(self.t0,pytz.timezone('America/Montreal')).astimezone(pytz.utc)
+        self.t_arr_datetime=dt0+timedeltas
+        if 'CHIME' in site_class.name:
             self.t_arr_datetime=np.array([datetime.datetime.fromtimestamp(x,pytz.utc) for x in self.t])
-        elif 'WLC' in site_class.name:
-            timedeltas=np.array([datetime.timedelta(seconds=x) for x in self.t])
-            dt0=datetime.datetime.fromtimestamp(self.t0,pytz.timezone('America/Montreal')).astimezone(pytz.utc)
-            self.t_arr_datetime=dt0+timedeltas
-        elif 'D3A' in site_class.name:
+        if 'D3A' in site_class.name:
             self.t_arr_datetime=np.array([datetime.datetime.fromtimestamp(1e-9*x,pytz.utc) for x in self.t])
-        else:
-            timedeltas=np.array([datetime.timedelta(seconds=x) for x in self.t])
-            dt0=datetime.datetime.fromtimestamp(self.t0,pytz.timezone('America/Montreal')).astimezone(pytz.utc)
-            self.t_arr_datetime=dt0+timedeltas
         self.t_index=np.arange(len(self.t))
