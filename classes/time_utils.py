@@ -9,11 +9,11 @@
 
 ## 20211110 - WT - creating a new file to contain time fitting functions:
 
-import datetime
+import datetime, pandas,os,h5py,pytz
 from scipy.signal import square
 from scipy.stats import pearsonr
 import numpy as np
-import pandas
+
 
 ## Annie's function for fixing the time axis:
     # (9/28/2021) function for adding sub-second accuracy to DJI timestamps
@@ -67,3 +67,110 @@ def Pulsed_Data_Waveform(total_duration,period,duty_cycle_on):
     ## Create a timedelta array for interpolation purposes so we can interpolate the square wave later:
     t_arr_datetime=np.array([datetime.timedelta(seconds=timeval) for timeval in t_arr_s])
     return t_arr_s,t_arr_datetime,switch_signal_arr
+
+
+def Find_File_And_Next(est_time_str, base_path, use_dst=True):
+    """
+    Given a time in EST/EDT, return:
+      - the file containing that time (if any)
+      - the next file in sequence (if it exists)
+    """
+    # EST/EDT offset
+    offset_hours = -4 if use_dst else -5
+    est_offset = datetime.timedelta(hours=offset_hours)
+
+    # parse target time
+    est_time = datetime.datetime.strptime(est_time_str, "%Y-%m-%d %H:%M:%S")
+    est_time = est_time.replace(tzinfo=datetime.timezone(est_offset))
+    utc_target = est_time.astimezone(datetime.timezone.utc)
+
+    # gather sorted files
+    results = []
+    for fname in sorted(os.listdir(base_path)):
+        if not fname.isdigit() or len(fname) != 4:
+            continue
+        fpath = os.path.join(base_path, fname)
+        try:
+            with h5py.File(fpath, 'r') as fd:
+                ctimes = fd['index_map']['time']['ctime'][:]
+                t0, t1 = ctimes[0], ctimes[-1]
+        except Exception:
+            continue
+
+        utc_start = datetime.datetime.fromtimestamp(t0, tz=datetime.timezone.utc)
+        utc_end   = datetime.datetime.fromtimestamp(t1, tz=datetime.timezone.utc)
+
+        results.append({
+            "file": int(fname),
+            "UTC_start": utc_start,
+            "UTC_end": utc_end,
+            "EST_start": utc_start + est_offset,
+            "EST_end": utc_end + est_offset
+        })
+
+    # make sure sorted by file number
+    results = sorted(results, key=lambda r: r["file"])
+
+    containing, next_file = None, None
+    for i, r in enumerate(results):
+        if r["UTC_start"] <= utc_target <= r["UTC_end"]:
+            containing = r
+            next_file = results[i+1] if i+1 < len(results) else None
+            break
+        elif r["UTC_end"] < utc_target:
+            containing = r  # keep updating until we pass the target
+        elif r["UTC_start"] > utc_target:
+            next_file = r
+            break
+
+    return containing, next_file
+
+def Get_File_Times(file_number, base_path, use_dst=True):
+    """
+    Given a 4-digit file number, open the correlator HDF5 file and return 
+    the UTC and EST/EDT start/end times.
+    
+    Parameters
+    ----------
+    file_number : int or str
+        The file number (e.g. 5, 202, or '0202').
+    base_path : str
+        Path to the directory containing the correlator files 
+        (everything up to but not including the file number).
+    use_dst : bool
+        If True, adjust to Eastern Daylight Time (UTC-4) in summer months,
+        otherwise keep fixed at EST (UTC-5).
+    
+    Returns
+    -------
+    dict
+        Dictionary with UTC and EST/EDT start/end times as datetime objects.
+    """
+    # normalize file number into zero-padded 4-digit string
+    fname = str(file_number).zfill(4)
+    fpath = os.path.join(base_path, fname)
+    
+    with h5py.File(fpath, 'r') as fd:
+        ctimes = fd['index_map']['time']['ctime'][:]
+    
+    # get first and last ctime
+    t0 = ctimes[0]
+    t_end = ctimes[-1]
+    
+    # convert to datetime (UTC)
+    utc_start = datetime.datetime.fromtimestamp(t0, tz=datetime.timezone.utc)
+    utc_end   = datetime.datetime.fromtimestamp(t_end, tz=datetime.timezone.utc)
+    
+    # Eastern offset: UTC-4 (daylight) or UTC-5 (standard)
+    offset_hours = -4 if use_dst else -5
+    est_offset = datetime.timedelta(hours=offset_hours)
+    
+    est_start = utc_start + est_offset
+    est_end   = utc_end + est_offset
+    
+    return {
+        "UTC_start": utc_start,
+        "UTC_end": utc_end,
+        "EST_start": est_start,
+        "EST_end": est_end,
+    }
