@@ -1,15 +1,17 @@
 flight_info:
-    flights: ['Jul-17th-2025-12-16PM-Flight-Airdata.csv']
-    desc: ['NS']
-    tlbs: [700]
-    tubs: [11700]
-    cdats: ['20250717T160156Z_WVUc52']
-    fmins: [87]
-    fmaxes: [202]
-    pols: ['N']
-    attns: [0]
-    tclbs: [1846]
-    tcubs: [28077]
+    flights: ['Jul-14th-2025-10-14AM-Flight-Airdata.csv',
+            'Jul-17th-2025-12-16PM-Flight-Airdata.csv',
+            'Jul-17th-2025-12-47PM-Flight-Airdata.csv']
+    desc: ['NS','NS','NS']
+    tlbs: [0,700,750]
+    tubs: [-1,11700,11300]
+    cdats: ['20250714T135821Z_WVUc52','20250717T160156Z_WVUc52','20250717T160156Z_WVUc52']
+    fmins: [94,87,261]
+    fmaxes: [229,202,380]
+    pols: ['N','N','N']
+    attns: [0,0,0]
+    tclbs: [0,1846,1816]
+    tcubs: [-1,28077,26971]
     masks: ['None','None','None','None','None']
 
 flag_info:
