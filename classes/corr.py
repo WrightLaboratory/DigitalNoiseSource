@@ -80,8 +80,11 @@ class Corr_Data:
         self.sat=np.zeros((n_files,vis.shape[0],vis.shape[1],self.n_channels))
         self.V_cross=np.zeros((n_files,vis.shape[0],vis.shape[1],len(self.crossmap))).astype(complex)
         # Get gain file (for all data files) if it exists...
-        if Load_Gains==True:
-            self.gainfile=os.listdir(self.Gain_Directory)[0]
+        self.gainfile=os.listdir(self.Gain_Directory)[0]
+        digital_gain=np.ones((len(self.freq),self.n_channels))
+        self.gain_coeffs=np.ones(len(self.freq))
+        self.gain_exp=np.ones(vis.shape[2])
+        if Load_Gains==True: 
             try:
                 fg=h5py.File(self.Gain_Directory+self.gainfile,'r')
                 self.gain_coeffs=fg['gain_coeff'][0] 
@@ -91,14 +94,10 @@ class Corr_Data:
                 fg.close()
             except OSError:
                 print("  --> ERROR: Gain file not found in specified directory!")
-        elif Fix_Gains==True:
+        if Fix_Gains==True:
             digital_gain=Gain_Params[0]*np.array((2**Gain_Params[1])*np.ones((vis.shape[1],self.n_channels))).astype(complex)
             self.gain_coeffs=Gain_Params[0]*np.ones(len(self.freq))
             self.gain_exp=Gain_Params[1]*np.ones(vis.shape[2])
-        elif Apply_Gains==False:
-            digital_gain=np.ones((len(self.freq),self.n_channels))
-            self.gain_coeffs=np.ones(len(self.freq))
-            self.gain_exp=np.ones(vis.shape[2])
         self.gain=digital_gain.real[flb:fub,:]
         fd.close()
         ## Loop over all files to populate V_full,t_full
