@@ -87,7 +87,8 @@ class Drone_Data:
             self.altitude=(np.array(drone_data['altitude(feet)'])[:])*0.3048 -self.origin[2]
             self.t_arr_timestamp=np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
             self.t_index=np.arange(len(self.t_arr_timestamp))
-            t0=self.t_arr_timestamp[0]
+            #t0=self.t_arr_timestamp[0]
+            t0=self.t_arr_timestamp[0] - datetime.timedelta(seconds=1E-3*np.array(drone_data['time(millisecond)'])[0])
             datetimes=[t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
             self.t_arr_datetime=np.array(datetimes,dtype='object')
         else:
