@@ -60,30 +60,14 @@ class Drone_Data:
             """
             Internal helper to read the drone CSV with or without skipping rows.
             """
-            if skip_rows_flag:
-                # Original behavior: skip first 500 rows (plus tlb offset)
-                if tlb == 0:
-                    skip_rows = np.arange(1, 500).tolist()
-                else:
-                    skip_rows = np.arange(1, 500 + tlb).tolist()
-
-                if tub == -1:
-                    drone_data = pandas.read_csv(path, skiprows=skip_rows, low_memory=False)
-                else:
-                    num_rows = tub - tlb
-                    drone_data = pandas.read_csv(path, skiprows=skip_rows, nrows=num_rows, low_memory=False)
-
-                print(f"  --> Skipping rows {skip_rows[0]} to {skip_rows[-1]} to eliminate NAN values")
-
-            else:
-                # New behavior: do not skip any rows
-                if tub == -1:
-                    drone_data = pandas.read_csv(path, low_memory=False)
-                else:
-                    num_rows = tub - tlb
-                    drone_data = pandas.read_csv(path, nrows=num_rows, low_memory=False)
-
-                print("  --> Not skipping any rows (skip_rows=False)")
+            if tlb != 0: # provided a lower bound
+                skip_rows = np.arange(1,tlb).tolist()
+            else: skip_rows = None
+    
+            if tub != -1: # provided an upper bound
+                num_rows = tub - tlb
+            else: num_rows = None
+            drone_data=pandas.read_csv(self.Drone_Directory+self.FLYTAG,skiprows=skip_rows,nrows=num_rows,low_memory=False)
 
             return drone_data
 
@@ -112,17 +96,32 @@ class Drone_Data:
             self.velocity=np.array(drone_data['speed(mph)'])*0.44704 # convert to m/s
             self.hmsl=np.array(drone_data['altitude_above_seaLevel(feet)'])*0.3048
             self.altitude=(np.array(drone_data['altitude(feet)'])[:])*0.3048 -self.origin[2]
-            self.t_arr_timestamp=np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
-            self.t_index=np.arange(len(self.t_arr_timestamp))
-            #t0=self.t_arr_timestamp[0]
-            t0=self.t_arr_timestamp[0] - datetime.timedelta(seconds=1E-3*np.array(drone_data['time(millisecond)'])[0])
-            datetimes=[t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
-            self.t_arr_datetime=np.array(datetimes,dtype='object')
+            
             self.latitude = np.array(drone_data['latitude'])
             self.longitude = np.array(drone_data['longitude'])
             self.pitch = np.array(drone_data[' pitch(degrees)'])
             self.roll = np.array(drone_data[' roll(degrees)'])
             self.yaw = np.array(drone_data[' compass_heading(degrees)'])
+            
+            # timestamp handler
+            # old code
+            #self.t_arr_timestamp=np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
+            #self.t_index=np.arange(len(self.t_arr_timestamp))
+            ##t0=self.t_arr_timestamp[0]
+            #t0=self.t_arr_timestamp[0] - datetime.timedelta(seconds=1E-3*np.array(drone_data['time(millisecond)'])[0])
+            #datetimes=[t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
+            #self.t_arr_datetime=np.array(datetimes,dtype='object')
+            
+            # This corrects for the fact that the milliseconds starts at 0, assumes UTC PPS absolute ok
+            self.t_arr_timestamp = np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
+            self.t_index=np.arange(len(self.t_arr_timestamp))
+            t = 1
+            while self.t_arr_timestamp[t] == self.t_arr_timestamp[t-1]: t=t+1 # get first time timestamp changes
+            t_off = 1000-drone_data['time(millisecond)'][t]
+            self.t0 = self.t_arr_timestamp[0] + datetime.timedelta(seconds=1E-3*np.array(t_off))
+            datetimes=[self.t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
+            self.t_arr_datetime = np.array(datetimes,dtype='object')
+            
 
             # Load velocity (check for either mph or m/s)
             if 'speed(mph)' in drone_data.columns:
