@@ -48,6 +48,7 @@ import time_utils as tu
 
 class Drone_Data:
     def __init__(self,Drone_Directory,FLYTAG,site_class,tlb=0,tub=-1,ignore_rtk=False):
+        print('USING NEW DRONE CLASS')
         self.FLYTAG=FLYTAG
         self.Drone_Directory=Drone_Directory
         ## Import variables from site-specific site_class object:
@@ -62,20 +63,21 @@ class Drone_Data:
         self.dish_pointings=site_class.pointings
         self.dish_polarizations=site_class.polarizations
         ## Read Drone RTK Data
-        if tlb == 0: 
-            skip_rows = np.arange(1,500).tolist()
-        else: skip_rows = np.arange(1,500+tlb).tolist()
-        if tub == -1:
-            drone_data=pandas.read_csv(self.Drone_Directory+self.FLYTAG,skiprows=skip_rows,low_memory=False)
-        else:
-            num_rows = tub - tlb 
-            drone_data=pandas.read_csv(self.Drone_Directory+self.FLYTAG,skiprows=skip_rows,nrows=num_rows,low_memory=False)
+        
+        # this enables using tlb, tub, if specified:
+        if tlb != 0: # provided a lower bound
+            skip_rows = np.arange(1,tlb).tolist()
+        else: skip_rows = None
+    
+        if tub != -1: # provided an upper bound
+            num_rows = tub - tlb
+        else: num_rows = None
+        drone_data=pandas.read_csv(self.Drone_Directory+self.FLYTAG,skiprows=skip_rows,nrows=num_rows,low_memory=False)
+        
         ## Assign Drone RTK Data to class variables:
         self.ignore_rtk=ignore_rtk
         ## Adding code for Airdata.csv methods for RTK 300
         if "Airdata" in self.FLYTAG:
-            print("Initializing drone data via Airdata.csv routine: {}".format(self.FLYTAG))
-            print("  --> Skipping rows {} to {} to eliminate NAN values".format(skip_rows[0],skip_rows[-1]))
             ## Load data columns from airdata files:
             self.latitude=np.array(drone_data['latitude'])
             self.longitude=np.array(drone_data['longitude'])
@@ -85,12 +87,23 @@ class Drone_Data:
             self.velocity=np.array(drone_data['speed(mph)'])*0.44704 # convert to m/s
             self.hmsl=np.array(drone_data['altitude_above_seaLevel(feet)'])*0.3048
             self.altitude=(np.array(drone_data['altitude(feet)'])[:])*0.3048 -self.origin[2]
-            self.t_arr_timestamp=np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
+            #self.t_arr_timestamp=np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
+            #self.t_index=np.arange(len(self.t_arr_timestamp))
+            ##t0=self.t_arr_timestamp[0]
+            #t0=self.t_arr_timestamp[0] - datetime.timedelta(seconds=1E-3*np.array(drone_data['time(millisecond)'])[0])
+            #datetimes=[t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]          
+            #self.t_arr_datetime=np.array(datetimes,dtype='object')
+            
+            # This corrects for the fact that the milliseconds starts at 0, assumes UTC PPS absolute ok
+            self.t_arr_timestamp = np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
             self.t_index=np.arange(len(self.t_arr_timestamp))
-            #t0=self.t_arr_timestamp[0]
-            t0=self.t_arr_timestamp[0] - datetime.timedelta(seconds=1E-3*np.array(drone_data['time(millisecond)'])[0])
-            datetimes=[t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
-            self.t_arr_datetime=np.array(datetimes,dtype='object')
+            t = 1
+            while self.t_arr_timestamp[t] == self.t_arr_timestamp[t-1]: t=t+1 # get first time timestamp changes
+            t_off = 1000-drone_data['time(millisecond)'][t]
+            self.t0 = self.t_arr_timestamp[0] + datetime.timedelta(seconds=1E-3*np.array(t_off))
+            datetimes=[self.t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
+            self.t_arr_datetime = np.array(datetimes,dtype='object')
+            
         else:
             print("Initializing drone data via datcon_csv routine: {}".format(self.FLYTAG))
             print("  --> Skipping rows {} to {} to eliminate NAN values".format(skip_rows[0],skip_rows[-1]))
