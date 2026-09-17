@@ -1,0 +1,327 @@
+#     _
+#    | |
+#  __| |_ __ ___  _ __   ___   _ __  _   _
+# / _` | '__/ _ \| '_ \ / _ \ | '_ \| | | |
+#| (_| | | | (_) | | | |  __/_| |_) | |_| |
+# \__,_|_|  \___/|_| |_|\___(_) .__/ \__, |
+#                             | |     __/ |
+#                             |_|    |___/
+
+#######################################################
+##                  Module Contents                  ##
+#######################################################
+
+## 07/31 Generalization fix: the "per-dish" coordinate arrays (xyz_per_dish,
+##   rpt_r_per_dish, rpt_t_per_dish) used to be built by looping
+##   `range(self.n_dishes)` and indexing `self.dish_coords[i]` -- silently
+##   assuming dish_coords was ordered as exactly n_dishes unique rows (i.e.
+##   half as many dishes as channels, each dish occupying two consecutive
+##   channel rows). In practice dish_coords is channel-ordered (length
+##   n_channels), can contain NaN rows for channels with no associated dish
+##   (e.g. a Reference channel), and channels sharing one physical dish don't
+##   have to be adjacent or come in pairs at all. The old loop would silently
+##   use whatever landed in the first n_dishes rows -- sometimes a NaN row,
+##   sometimes the same physical dish twice, and would never even reach rows
+##   beyond index n_dishes-1, permanently omitting the rest.
+##   Fixed by indexing these arrays by CHANNEL (length n_channels, matching
+##   dish_coords/dish_pointings exactly) and skipping any channel with no
+##   valid dish assigned. concat.py needs no changes for this -- it already
+##   sizes its interpolated per-dish arrays off of xyz_per_dish.shape[0]
+##   dynamically.
+
+import numpy as np
+from matplotlib.pyplot import *
+import glob
+import os
+import datetime
+from scipy.optimize import curve_fit, leastsq, least_squares
+from random import sample
+from astropy.time import Time
+from matplotlib import colors
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.colors import LogNorm
+from matplotlib.ticker import MultipleLocator
+import pytz
+import bisect
+import pygeodesy
+from mpl_toolkits import mplot3d
+import pandas
+import sys
+
+## Import packages from our own module:
+sys.path.insert(0, '../classes/')
+import fitting_utils as fu
+import geometry_utils as gu
+import time_utils as tu
+
+
+class Drone_Data:
+    def __init__(self, Drone_Directory, FLYTAG, site_class, tlb=0, tub=-1, ignore_rtk=False, skip_rows=False):
+        self.FLYTAG = FLYTAG
+        self.Drone_Directory = Drone_Directory
+        ## Import variables from site-specific site_class object:
+        self.name = site_class.name
+        self.n_dishes = site_class.n_dishes
+        self.n_channels = site_class.n_channels
+        self.chmap = site_class.chmap
+        self.origin = site_class.origin
+        self.prime_origin = pygeodesy.EcefCartesian(latlonh0=self.origin[0], lon0=self.origin[1], height0=self.origin[2])
+        self.dish_keystrings = site_class.keystrings
+        self.dish_coords = site_class.coords
+        self.dish_pointings = site_class.pointings
+        self.dish_polarizations = site_class.polarizations
+
+        #######################################################
+        ## Read Drone RTK Data with skip_rows flag
+        #######################################################
+        def _read_drone_csv(path, skip_rows_flag, tlb, tub):
+            """
+            Internal helper to read the drone CSV with or without skipping rows.
+            """
+            if tlb != 0: # provided a lower bound
+                skip_rows = np.arange(1,tlb).tolist()
+            else: skip_rows = None
+
+            if tub != -1: # provided an upper bound
+                num_rows = tub - tlb
+            else: num_rows = None
+            drone_data=pandas.read_csv(self.Drone_Directory+self.FLYTAG,skiprows=skip_rows,nrows=num_rows,low_memory=False)
+
+            return drone_data
+
+        # Read the actual CSV file
+        drone_data = _read_drone_csv(
+            self.Drone_Directory + self.FLYTAG,
+            skip_rows_flag=skip_rows,
+            tlb=tlb,
+            tub=tub
+        )
+
+        #######################################################
+        ## Assign Drone RTK Data to class variables:
+        #######################################################
+        self.ignore_rtk = ignore_rtk
+
+        ## Adding code for Airdata.csv methods for RTK 300
+        if "Airdata" in self.FLYTAG:
+            print("Initializing drone data via Airdata.csv routine: {}".format(self.FLYTAG))
+            ## Load data columns from airdata files:
+            self.latitude=np.array(drone_data['latitude'])
+            self.longitude=np.array(drone_data['longitude'])
+            self.roll=np.array(drone_data[' roll(degrees)'])
+            self.yaw=np.array(drone_data[' compass_heading(degrees)'])
+            self.pitch=np.array(drone_data[' pitch(degrees)'])
+            self.velocity=np.array(drone_data['speed(mph)'])*0.44704 # convert to m/s
+            self.hmsl=np.array(drone_data['altitude_above_seaLevel(feet)'])*0.3048
+            self.altitude=(np.array(drone_data['altitude(feet)'])[:])*0.3048 -self.origin[2]
+
+            self.latitude = np.array(drone_data['latitude'])
+            self.longitude = np.array(drone_data['longitude'])
+            self.roll = np.array(drone_data[' roll(degrees)'])
+
+            # timestamp handler
+            # old code
+            #self.t_arr_timestamp=np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
+            #self.t_index=np.arange(len(self.t_arr_timestamp))
+            ##t0=self.t_arr_timestamp[0]
+            #t0=self.t_arr_timestamp[0] - datetime.timedelta(seconds=1E-3*np.array(drone_data['time(millisecond)'])[0])
+            #datetimes=[t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
+            #self.t_arr_datetime=np.array(datetimes,dtype='object')
+
+            # This corrects for the fact that the milliseconds starts at 0, assumes UTC PPS absolute ok
+            self.t_arr_timestamp = np.array(pandas.to_datetime(drone_data['datetime(utc)'],utc=True),dtype='object')
+            self.t_index=np.arange(len(self.t_arr_timestamp))
+            t = 1
+            while self.t_arr_timestamp[t] == self.t_arr_timestamp[t-1]: t=t+1 # get first time timestamp changes
+            t_off = 1000-drone_data['time(millisecond)'][t]
+            self.t0 = self.t_arr_timestamp[0] + datetime.timedelta(seconds=1E-3*np.array(t_off))
+            datetimes=[self.t0+datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
+            self.t_arr_datetime = np.array(datetimes,dtype='object')
+
+
+            # Load velocity (check for either mph or m/s)
+            if 'speed(mph)' in drone_data.columns:
+                self.velocity = np.array(drone_data['speed(mph)']) * 0.44704  # mph → m/s
+            elif 'speed(m/s)' in drone_data.columns:
+                self.velocity = np.array(drone_data['speed(m/s)'])
+            else:
+                raise KeyError("No recognized speed column found.")
+
+            # Load altitude above sea level (feet or meters)
+            if 'altitude_above_seaLevel(feet)' in drone_data.columns:
+                self.hmsl = np.array(drone_data['altitude_above_seaLevel(feet)']) * 0.3048
+            elif 'altitude_above_seaLevel(meters)' in drone_data.columns:
+                self.hmsl = np.array(drone_data['altitude_above_seaLevel(meters)'])
+            else:
+                raise KeyError("No recognized sea level altitude column found.")
+
+            # Load raw altitude (feet or meters)
+            if 'altitude(feet)' in drone_data.columns:
+                self.altitude = np.array(drone_data['altitude(feet)']) * 0.3048 - self.origin[2]
+            elif 'altitude(meters)' in drone_data.columns:
+                self.altitude = np.array(drone_data['altitude(meters)']) - self.origin[2]
+            else:
+                raise KeyError("No recognized altitude column found.")
+
+            self.t_arr_timestamp = np.array(pandas.to_datetime(drone_data['datetime(utc)'], utc=True), dtype='object')
+            self.t_index = np.arange(len(self.t_arr_timestamp))
+            t0 = self.t_arr_timestamp[0]
+            datetimes = [t0 + datetime.timedelta(milliseconds=x) for x in drone_data['time(millisecond)']]
+            self.t_arr_datetime = np.array(datetimes, dtype='object')
+
+        else:
+            print("Initializing drone data via datcon_csv routine: {}".format(self.FLYTAG))
+            ## Load data from full datcon files:
+            if not self.ignore_rtk:
+                try:
+                    print("  --> Attempting to load position data from RTK")
+                    self.latitude = np.array(drone_data["RTKdata:Lat_P"])
+                    self.longitude = np.array(drone_data["RTKdata:Lon_P"])
+                    self.hmsl = np.array(drone_data["RTKdata:Hmsl_P"])
+                    nandtestsum = len(drone_data["RTKdata:Lat_P"][~np.isnan(drone_data["RTKdata:Lat_P"])])
+                    print("    --> RTK data contains {}/{} non-nan values".format(nandtestsum, len(drone_data["RTKdata:Lat_P"])))
+                    if nandtestsum == 0:
+                        print("    --> RTK Data not usable for this data file...")
+                        print("  --> Loading position data from GPS(0) instead:")
+                        if "GPS(0):Lat" in drone_data.columns:
+                            self.latitude = np.array(drone_data["GPS(0):Lat"])
+                        elif "GPS:Lat" in drone_data.columns:
+                            self.latitude = np.array(drone_data["GPS:Lat"])
+                        if "GPS(0):Long" in drone_data.columns:
+                            self.longitude = np.array(drone_data["GPS(0):Long"])
+                        elif "GPS:Long" in drone_data.columns:
+                            self.longitude = np.array(drone_data["GPS:Long"])
+                        if "GPS(0):heightMSL" in drone_data.columns:
+                            self.hmsl = np.array(drone_data["GPS(0):heightMSL"])
+                        elif "GPS:heightMSL" in drone_data.columns:
+                            self.hmsl = np.array(drone_data["GPS:heightMSL"])
+                except KeyError:
+                    print("    --> RTK Data not found for this data file...")
+                    print("  --> Loading position data from GPS(0) instead:")
+                    if "GPS(0):Lat" in drone_data.columns:
+                        self.latitude = np.array(drone_data["GPS(0):Lat"])
+                    elif "GPS:Lat" in drone_data.columns:
+                        self.latitude = np.array(drone_data["GPS:Lat"])
+                    if "GPS(0):Long" in drone_data.columns:
+                        self.longitude = np.array(drone_data["GPS(0):Long"])
+                    elif "GPS:Long" in drone_data.columns:
+                        self.longitude = np.array(drone_data["GPS:Long"])
+                    if "GPS(0):heightMSL" in drone_data.columns:
+                        self.hmsl = np.array(drone_data["GPS(0):heightMSL"])
+                    elif "GPS:heightMSL" in drone_data.columns:
+                        self.hmsl = np.array(drone_data["GPS:heightMSL"])
+            else:
+                print("  --> RTK Data is being ignored due to input args...")
+                print("  --> Loading position data from GPS(0) instead:")
+                if "GPS(0):Lat" in drone_data.columns:
+                    self.latitude = np.array(drone_data["GPS(0):Lat"])
+                elif "GPS:Lat" in drone_data.columns:
+                    self.latitude = np.array(drone_data["GPS:Lat"])
+                if "GPS(0):Long" in drone_data.columns:
+                    self.longitude = np.array(drone_data["GPS(0):Long"])
+                elif "GPS:Long" in drone_data.columns:
+                    self.longitude = np.array(drone_data["GPS:Long"])
+                if "GPS(0):heightMSL" in drone_data.columns:
+                    self.hmsl = np.array(drone_data["GPS(0):heightMSL"])
+                elif "GPS:heightMSL" in drone_data.columns:
+                    self.hmsl = np.array(drone_data["GPS:heightMSL"])
+
+            # Orientation, velocity, and timing
+            if "IMU_ATTI(0):roll" in drone_data.columns:
+                self.roll = np.array(drone_data["IMU_ATTI(0):roll"])
+            elif "IMU_ATTI(0):roll:C" in drone_data.columns:
+                self.roll = np.array(drone_data["IMU_ATTI(0):roll:C"])
+            if "IMU_ATTI(0):yaw360" in drone_data.columns:
+                self.yaw = np.array(drone_data["IMU_ATTI(0):yaw360"])
+            elif "IMU_ATTI(0):yaw360:C" in drone_data.columns:
+                self.yaw = np.array(drone_data["IMU_ATTI(0):yaw360:C"])
+            if "IMU_ATTI(0):pitch" in drone_data.columns:
+                self.pitch = np.array(drone_data["IMU_ATTI(0):pitch"])
+            elif "IMU_ATTI(0):pitch:C" in drone_data.columns:
+                self.pitch = np.array(drone_data["IMU_ATTI(0):pitch:C"])
+            if "IMU_ATTI(0):velComposite" in drone_data.columns:
+                self.velocity = np.array(drone_data["IMU_ATTI(0):velComposite"])
+            elif "IMU_ATTI(0):velComposite:C" in drone_data.columns:
+                self.velocity = np.array(drone_data["IMU_ATTI(0):velComposite:C"])
+            self.t_arr_timestamp = np.array(drone_data["GPS:dateTimeStamp"])
+            self.t_arr_datetime = np.array(tu.interp_time(drone_data)["UTC"], dtype='object')
+            self.altitude = self.hmsl - self.origin[2]
+
+            # Remove identical points
+            newll = np.concatenate((self.latitude, self.longitude)).reshape((len(self.latitude), 2), order='F')
+            nrri = np.sort(np.unique(newll, return_index=True, axis=0)[1])
+            self.latitude = self.latitude[nrri]
+            self.longitude = self.longitude[nrri]
+            self.hmsl = self.hmsl[nrri]
+            self.roll = self.roll[nrri]
+            self.yaw = self.yaw[nrri]
+            self.pitch = self.pitch[nrri]
+            self.velocity = self.velocity[nrri]
+            self.t_arr_timestamp = self.t_arr_timestamp[nrri]
+            self.t_index = np.arange(len(self.t_arr_timestamp))
+            self.t_arr_datetime = self.t_arr_datetime[nrri]
+            self.altitude = self.altitude[nrri]
+
+        #######################################################
+        ## Define coordinate systems
+        #######################################################
+        print("  --> generating llh, geocentric cartesian, local cartesian, and local spherical coordinates.")
+        self.coords_llh = np.nan * np.ones((self.t_index.shape[0], 3))
+        self.coords_xyz_GC = np.nan * np.ones((self.t_index.shape[0], 3))
+        self.coords_xyz_LC = np.nan * np.ones((self.t_index.shape[0], 3))
+        self.coords_rpt = np.nan * np.ones((self.t_index.shape[0], 3))
+
+        for i in self.t_index[np.where(np.isnan(self.latitude) == False)]:
+            try:
+                p_t = pygeodesy.ellipsoidalNvector.LatLon(self.latitude[i], lon=self.longitude[i], height=self.hmsl[i])
+            except:
+                print(f"    --> RangeError for index {i}")
+                continue
+            self.coords_llh[i] = p_t.to3llh()
+            self.coords_xyz_GC[i] = p_t.to3xyz()
+            self.coords_xyz_LC[i] = self.prime_origin.forward(p_t).toVector()
+            r_prime = np.sqrt(self.coords_xyz_LC[i, 0] ** 2.0 + self.coords_xyz_LC[i, 1] ** 2.0 + self.coords_xyz_LC[i, 2] ** 2.0)
+            phi_prime = np.arctan2(self.coords_xyz_LC[i, 1], self.coords_xyz_LC[i, 0])
+            if phi_prime < 0:
+                phi_prime = phi_prime + (2.0 * np.pi)
+            theta_prime = np.arccos(self.coords_xyz_LC[i, 2] / r_prime)
+            self.coords_rpt[i] = [r_prime, phi_prime, theta_prime]
+
+        #######################################################
+        ## Calculate per-CHANNEL polar coordinates
+        #######################################################
+        print("  --> generating dish and receiver line of sight coordinates.")
+        ## Indexed by CHANNEL (length n_channels), not n_dishes. dish_coords /
+        ## dish_pointings are already channel-ordered -- some channels may have
+        ## no associated dish (NaN coordinates, e.g. a Reference channel), and
+        ## any number of channels may legitimately share the same physical dish
+        ## location (e.g. an X/Y polarization pair, or more). Indexing by
+        ## channel means every array here is directly usable with the real
+        ## channel number, works for any distribution of channels-per-dish, and
+        ## never silently drops a dish because it happened to fall past the
+        ## first n_dishes rows.
+        self.xyz_per_dish = np.nan * np.ones((self.n_channels, len(self.t_index), 3))
+        self.rpt_r_per_dish = np.nan * np.ones((self.n_channels, len(self.t_index), 3))
+        self.rpt_t_per_dish = np.nan * np.ones((self.n_channels, len(self.t_index), 3))
+
+        for i in range(self.n_channels):
+            ## Skip channels with no associated dish (NaN coords/pointings) --
+            ## leave that channel's slot as NaN rather than computing garbage
+            ## from an invalid dish position:
+            if np.any(np.isnan(self.dish_coords[i])) or np.any(np.isnan(self.dish_pointings[i])):
+                continue
+            drone_xyz_RC = self.coords_xyz_LC - self.dish_coords[i]
+            self.xyz_per_dish[i, :, :] = drone_xyz_RC
+            rec_pointing_rot = gu.rot_mat(np.array([gu.xyz_to_rpt(self.dish_pointings[i])[2], 0.0, gu.xyz_to_rpt(self.dish_pointings[i])[1]]))
+            self.rpt_r_per_dish[i, :, :] = np.array([
+                gu.xyz_to_rpt(rec_pointing_rot @ drone_xyz_RC[k]) for k in range(len(self.coords_xyz_LC))
+            ])
+            rec_xyz_LC = -1.0 * (self.coords_xyz_LC) + self.dish_coords[i]
+            ypr = np.ndarray((len(self.t_index), 3))
+            ypr[:, 0] = self.yaw
+            ypr[:, 1] = self.pitch
+            ypr[:, 2] = self.roll
+            self.rpt_t_per_dish[i, :, :] = np.array([
+                gu.xyz_to_rpt(gu.rot_mat(ypr[m, :]) @ (gu.rot_mat(np.array([90.0, 0.0, 180.0])) @ rec_xyz_LC[m]))
+                for m in range(len(self.coords_xyz_LC))
+            ])

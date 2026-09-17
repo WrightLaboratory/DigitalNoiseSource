@@ -1,0 +1,20 @@
+flight_info:
+    flights: ['Jul-2nd-2026-07-08PM-Flight-Airdata.csv','Jul-2nd-2026-07-32PM-Flight-Airdata.csv','Jul-2nd-2026-07-59PM-Flight-Airdata.csv','Jul-2nd-2026-08-37PM-Flight-Airdata.csv']
+    cdats: ['drone_flight7_NWgrid_NEpol_42db_jul2_1900','drone_flight8_NWgrid_NWpol_42db_jul2_1930','drone_flight9_NEgrid_NEpol_42db_jul2_2000','drone_flight10_NEgrid_NWpol_42db_jul2_2030']
+    desc: ['NW','NW','NE','NE']
+    pols: ['NE','NW','NE','NW']
+    fmins: [?,3000]
+    fmaxes: [?,4400]
+    tlbs: [?,2450]
+    tubs: [?,11000]
+    time_correction: [?,-244.031]
+    start_freq_inds: [4000,3000]
+    stop_freq_inds: [12300,4400]
+
+flag_info:
+    NW_pols: [2,8]
+    NE_pols: [3,12]
+    Bicolog_pols: [1,4] 
+
+freq_info:
+   good_freqs: [3500]
