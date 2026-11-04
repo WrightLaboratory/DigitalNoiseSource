@@ -6,29 +6,71 @@
 # \____/\___/\_| \_\_| \_(_) .__/ \__, |
 #                          | |     __/ |
 #                          |_|    |___/
-## 08/21 Unified auto/cross channel model (both _initialize_corr and
-##   _initialize_crs): removed crossmap/V_cross and the separate "auto
-##   channel == V array" assumption. Every saved product between two used
-##   ports is now kept as one flat, non-repeating list: self.chan_prod
-##   (physical port pairs), self.chan_is_auto, and self.V (last axis =
-##   self.n_channels, complex-native -- take np.abs() downstream, never
-##   .real). New auto_only=False constructor arg restricts to autos only
-##   when set True. chmap/automap/gain/sat stay port-indexed (n_ports =
-##   len(site_class.chmap), unaffected by this change) -- self.n_dishes is
-##   now len(chmap) rather than an assumed n_channels/2 pairing.
-##   remove_real_imag_offset's offset_crossmap keeps meaning "list of raw
-##   product indices" (positions in self.prod) exactly as before, and the
-##   subtraction now happens directly on `vis` in raw-product-index space
-##   (before channel selection), so it applies correctly regardless of
-##   whether that product ends up kept as an auto or cross channel.
-##   Also fixed a bug in _initialize_crs's main loop: it was writing
-##   vis[...,automap].real into self.V once via automap AND AGAIN (for
-##   autos only) via the old crossmap-population step below it -- the first,
-##   redundant assignment is gone; V is populated once, from self.keep_idx,
-##   uniformly for every channel. The two large commented-out draft __init__
-##   blocks previously at the end of this file (dead code, never executed)
-##   were dropped for clarity -- shout if you wanted to keep any of that
-##   reference/history.
+##
+## 2026-11 Correlator data class for ICEBoard and CRS data.
+##
+## USER INPUT IS ONLY:
+##   * a site class file (site_utils.Site): which ports had something on them
+##     (chmap) and what it was (keystrings)
+##   * which instrument wrote the data: instrument='ice' (default) or 'crs'
+##
+##   corrdata = corr.Corr_Data(Data_Directory=datadir, Gain_Directory=gaindir,
+##                             site_class=gbosite, instrument='crs',
+##                             fbounds=[0,8192], Load_Gains=True, Apply_Gains=False,
+##                             remove_real_imag_offset=True,
+##                             Data_File_Index=[0,-1], offset_time_samples=100)
+##
+## The class knows each instrument's raw product ordering, finds every auto
+## and cross between the used ports, and names every channel from the site
+## file keystrings:
+##
+##   corrdata.V        all channels (time, freq, channel), complex
+##   corrdata.V_auto   autos only     (its own 0..n_auto-1 indexing)
+##   corrdata.V_cross  crosses only   (its own 0..n_cross-1 indexing)
+##
+##   corrdata.print_channels()     table: V index | V_auto / V_cross index | name | ports | ...
+##   corrdata.channel_table        same table as a pandas DataFrame
+##   print(corrdata.chnames)       0: Ref(1) x Ref(1) / 1: Ref(1) x Dish(3) / ...
+##   print(corrdata.cross_names)   the same, numbered as in V_cross
+##   corrdata.chnames[1]                  -> 'Ref(1) x Dish(3)'
+##   corrdata.chnames['Ref(1) x Dish(3)'] -> 1        (index in V)
+##   corrdata.cross_names['Ref(1) x Dish(3)'] -> 0    (index in V_cross)
+##   corrdata.chan_index('Ref', 'Dish')               -> 1  (keystrings, 'Ref(1)', or port numbers)
+##   corrdata.chan_index('Ref', 'Dish', array='V_cross') -> 0
+##   corrdata.get_chan('Dish', 'Ref')     data in exactly that order (conjugated if needed)
+##   corrdata.magnitude('Ref', 'Dish')    np.abs() of the channel
+##
+## AUTO vs CROSS:
+##   * auto  (A x A): power, imaginary part ~0, so np.abs(V) == V.real.
+##   * cross (A x B): complex (voltage-product) - magnitude is ONLY np.abs(V);
+##     V.real is just one quadrature component.
+##   Use np.abs() everywhere; it is correct for both. Channel names say which is
+##   which (A x A = auto). Every name reads exactly as the data is stored: if the
+##   instrument saved B x A but chmap order makes the name A x B, the data was
+##   conjugated on load so the name is literally true.
+##
+## GAINS (same recipe as the original corr.py):
+##   Both boards multiply each INPUT's channelised voltage by a digital gain g
+##   (per input, per frequency) before correlating. A product of inputs a and b
+##   therefore comes out scaled by g_a * g_b, so dividing every product - auto
+##   or cross - by g_a * g_b undoes it. One gain per input is all that's needed.
+##   ICEBoard: .h5 file, g = gain_coeff[0] * 2**gain_exp[0], all 16 inputs.
+##   CRS:      .npy file, (8, 8192), stored in FPGA bit-reversed bin order,
+##             descrambled here. In both cases the real part of g is used and
+##             V_ab /= g_a * g_b, exactly as the original.
+##
+## TIME:
+##   corrdata.t              UNIX seconds of every integration
+##   corrdata.t_rel          seconds since the first loaded integration
+##   corrdata.t_arr_datetime UTC datetimes
+##   ICEBoard default (time_source='fpga', as the original GBO code): FPGA
+##   counts (2.56 us each) relative to the first loaded integration, anchored
+##   to that integration's IRIG-B time (or ctime if use_ctime=True).
+##   time_source='irigb' or 'ctime' uses those per-integration stamps directly
+##   (what the old code did for D3A / CHIME). CRS: stamps are already UNIX s.
+##
+## No behaviour depends on the site name or the data file names.
+
 from matplotlib.pyplot import *
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.colors import LogNorm
@@ -37,621 +79,868 @@ import numpy as np
 import h5py
 import hdf5plugin
 import os
+import re
 import glob
 from matplotlib import colors
 import pandas
 import csv
 import datetime
 import pytz
-class Corr_Data:
-    def __init__(self,Data_Directory,Gain_Directory,site_class,
-                 Data_File_Index=[0,-1],Load_Gains=True,Fix_Gains=False,
-                 Apply_Gains=True,Gain_Params=[1.0,24.0],
-                 fbounds=[0,1024],use_ctime=False,
-                 esystem=False,
 
-                 crs=False,
-                 auto_only=False,
-                 # NEW OFFSET PARAMETERS
+
+############################################################
+# INSTRUMENTS AND PRODUCT MAPS
+############################################################
+INSTRUMENT_ALIASES = {'ice': 'ICE', 'iceboard': 'ICE', 'ice_board': 'ICE', 'crs': 'CRS'}
+INSTRUMENT_LONGNAME = {'ICE': 'ICEBoard', 'CRS': 'CRS board'}
+FPGA_SECONDS_PER_COUNT = 2.56e-6
+
+## CRS: the board always writes all 36 products of its 8 inputs (you can't
+## select fewer), but index_map/prod isn't populated correctly, so the order is
+## defined here. Covers all 8 autos + 28 crosses exactly once.
+CRS_PROD = np.array([
+    [0,0],[0,1],[0,2],[0,3],
+    [1,1],[1,2],[1,3],[1,4],
+    [2,2],[2,3],[2,4],[2,5],
+    [3,3],[3,4],[3,5],[3,6],
+    [4,4],[4,5],[4,6],[4,7],
+    [5,5],[5,6],[5,7],[0,4],
+    [6,6],[6,7],[0,5],[1,5],
+    [7,7],[0,6],[1,6],[2,6],
+    [0,7],[1,7],[2,7],[3,7],
+], dtype=int)
+
+
+def ice_prod_map(n_inputs):
+    """ICEBoard product order for inputs 0..n_inputs-1 (the board always records
+    the first N inputs, in order): upper triangle row by row, autos included,
+        (0,0),(0,1),...,(0,N-1),(1,1),...,(N-1,N-1)
+    e.g. N=4 -> 10 products; (1,1)=4, (1,3)=6, (3,3)=9."""
+    return np.array([[a, b] for a in range(n_inputs) for b in range(a, n_inputs)], dtype=int)
+
+
+def _n_inputs_from_n_prod(n_prod):
+    n = int(round((np.sqrt(8 * n_prod + 1) - 1) / 2))
+    return n if n * (n + 1) // 2 == n_prod else None
+
+
+def _plural(n, word):
+    return '{} {}'.format(n, word if n == 1 else (word + 'es' if word.endswith('ss') else word + 's'))
+
+
+def _to_complex(arr):
+    """complex128, handling structured ('r','i') dtypes."""
+    arr = np.asarray(arr)
+    if arr.dtype.names is not None and 'r' in arr.dtype.names and 'i' in arr.dtype.names:
+        return arr['r'].astype(np.float64) + 1j * arr['i'].astype(np.float64)
+    return arr.astype(np.complex128)
+
+
+############################################################
+# CHANNEL NAME LIST
+############################################################
+_X_SPLIT = re.compile(r'\s+[xX×]\s+|(?<=\))\s*[xX×]\s*(?=\S)')
+
+
+def _norm_name(s):
+    return re.sub(r'\s+', '', str(s))
+
+
+class ChannelNames(list):
+    """Channel names that print as a numbered list and index both ways:
+        names[1]                  -> 'Ref(1) x Dish(3)'
+        names['Ref(1) x Dish(3)'] -> 1   (whitespace-insensitive)
+        names[:] / names[[0,2]]   -> numbered sub-list keeping the original indices
+    `array` says which array the numbers index ('V', 'V_auto' or 'V_cross')."""
+    def __init__(self, names, idx=None, array='V'):
+        super().__init__([str(n) for n in names])
+        self._idx = list(range(len(self))) if idx is None else [int(i) for i in idx]
+        self.array = array
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self.index(key)
+        if isinstance(key, slice):
+            sel = list(range(len(self)))[key]
+        elif isinstance(key, (list, tuple, np.ndarray)):
+            key = np.asarray(key)
+            sel = list(np.where(key)[0]) if key.dtype == bool else [int(k) for k in key]
+        else:
+            return list.__getitem__(self, key)
+        return ChannelNames([list.__getitem__(self, i) for i in sel],
+                            idx=[self._idx[i] for i in sel], array=self.array)
+
+    def index(self, name, *args):
+        target = _norm_name(name)
+        for pos, n in enumerate(self):
+            if _norm_name(n) == target:
+                return self._idx[pos]
+        parts = _X_SPLIT.split(str(name).strip())
+        if len(parts) == 2:
+            swapped = _norm_name(parts[1] + ' x ' + parts[0])
+            for pos, n in enumerate(self):
+                if _norm_name(n) == swapped:
+                    raise KeyError(
+                        "'{}' is stored as '{}' ({} index {}). Your order is its complex "
+                        "conjugate - corrdata.get_chan(...) returns it conjugated.".format(
+                            name, n, self.array, self._idx[pos]))
+        raise KeyError("No channel named '{}' in {}. Available:\n{}".format(
+            name, self.array, str(self)))
+
+    def __str__(self):
+        if len(self) == 0:
+            return '(no channels)'
+        w = len(str(max(self._idx)))
+        return '\n'.join('{:>{w}}: {}'.format(i, n, w=w) for i, n in zip(self._idx, self))
+
+    __repr__ = __str__
+
+
+############################################################
+# MAIN CLASS
+############################################################
+class Corr_Data:
+    def __init__(self, Data_Directory, Gain_Directory, site_class,
+                 instrument=None,
+                 Data_File_Index=[0, -1], Load_Gains=True, Fix_Gains=False,
+                 Apply_Gains=True, Gain_Params=[1.0, 24.0],
+                 fbounds=[0, 1024],
+                 use_ctime=False, time_source='fpga',
+                 skip_last_file=None,
+                 esystem=False,
                  remove_real_imag_offset=False,
-                 offset_crossmap=[],
                  offset_file_index=0,
                  offset_time_samples=400,
-                 offset_freq_index=0,
-                 plot_offset_diagnostic=True):
+                 **deprecated):
         """
-        auto_only : bool, default False
-            Every saved product is already a fully-formed correlation --
-            auto (real, imag~0) or cross (complex, imag!=0) -- there is no
-            "raw"/uncorrelated retrieval mode. By default every saved
-            auto+cross product between used channels is kept as one flat,
-            non-repeating list (self.chan_prod / self.chan_is_auto /
-            self.V, last axis length self.n_channels). Pass auto_only=True
-            to restrict to only the auto-correlations (channel count then
-            equals the number of used physical ports).
+        Data_Directory  folder of correlator .h5 files
+        Gain_Directory  ICE: folder holding the gain .h5 (or the .h5 itself)
+                        CRS: the .npy gain file for this acquisition
+        site_class      site_utils.Site (chmap, keystrings, n_channels)
+        instrument      'ice' (default) or 'crs'
+        Data_File_Index [start, stop] slice of the file list (default [0,-1]);
+                        None = all files; or any other list of file indices
+        Load_Gains      read the gain file
+        Fix_Gains       use Gain_Params[0] * 2**Gain_Params[1] for every input
+                        instead (takes priority over Load_Gains)
+        Apply_Gains     divide gains out of the data
+        fbounds         [first, last) frequency channels to load
+        use_ctime       ICE: anchor the FPGA time axis to ctime, not IRIG-B
+        time_source     ICE: 'fpga' (default), 'irigb' or 'ctime' (see header)
+        skip_last_file  drop the newest file (may still be being written).
+                        Default: True for ICE (as the original), False for CRS
+        esystem         CHIME-format eigen-system files: use eigenvalue 0 x |evec 0|^2
+        remove_real_imag_offset
+                        subtract the median real and imaginary offset (per
+                        frequency) from every CROSS channel, estimated from the
+                        first offset_time_samples integrations of file number
+                        offset_file_index. Autos untouched. Stored as
+                        corrdata.offset_real / offset_imag, shape (freq, n_cross),
+                        column k = V_cross channel k.
         """
-        if crs:
-            self._initialize_crs(
-                Data_Directory,
-                Gain_Directory,
-                site_class,
-                Data_File_Index,
-                Load_Gains,
-                Fix_Gains,
-                Apply_Gains,
-                Gain_Params,
-                fbounds,
-                auto_only,
-                esystem,
-                remove_real_imag_offset,
-                offset_crossmap,
-                offset_file_index,
-                offset_time_samples,
-                offset_freq_index,
-                plot_offset_diagnostic,
-            )
+        ## ---- keywords from older versions ----
+        crs_flag = deprecated.pop('crs', None)
+        notes = {
+            'crossmap': "crossmap is no longer needed: every auto and cross between the "
+                        "chmap ports is loaded (see corrdata.V_cross / print_channels()).",
+            'offset_crossmap': "offset_crossmap is no longer needed: offsets are removed from "
+                               "every cross channel.",
+            'auto_only': "auto_only was removed: use corrdata.V_auto.",
+            'offset_freq_index': "offset_freq_index / plot_offset_diagnostic: the offset plot "
+                                 "has moved out of corr (to go in fitting_utils).",
+            'plot_offset_diagnostic': None,
+        }
+        notes['plot_offset_diagnostic'] = notes['offset_freq_index']
+        shown = set()
+        for old, msg in notes.items():
+            if old in deprecated:
+                deprecated.pop(old)
+                if msg not in shown:
+                    print("  --> NOTE: " + msg)
+                    shown.add(msg)
+        if deprecated:
+            raise TypeError("Corr_Data got unexpected keyword(s): {}".format(list(deprecated)))
+
+        defaulted = instrument is None and not crs_flag
+        if instrument is None:
+            instrument = 'crs' if crs_flag else 'ice'
+        key = str(instrument).strip().lower()
+        if key not in INSTRUMENT_ALIASES:
+            raise ValueError("instrument must be 'ice' or 'crs', got {!r}".format(instrument))
+        self.instrument = INSTRUMENT_ALIASES[key]
+        time_source = str(time_source).lower()
+        if time_source not in ('fpga', 'irigb', 'ctime'):
+            raise ValueError("time_source must be 'fpga', 'irigb' or 'ctime'")
+
+        self.Data_Directory = Data_Directory
+        self.Gain_Directory = Gain_Directory
+        self.site_class = site_class
+        self.fbounds = list(fbounds)
+        self.use_ctime = use_ctime
+        self.time_source = time_source
+        self.esystem = esystem
+        self.Apply_Gains = Apply_Gains
+        self._cache = {}
+
+        print('Initializing Correlator Class')
+        print("  --> Instrument: {} (instrument='{}'){}".format(
+            INSTRUMENT_LONGNAME[self.instrument], self.instrument.lower(),
+            '  [not specified -> default]' if defaulted else ''))
+        print("  --> Data: " + str(self.Data_Directory))
+
+        ## ---- file list ----
+        if skip_last_file is None:
+            skip_last_file = self.instrument == 'ICE'
+        filelist = self._list_files(skip_last_file)
+        self.filenames = self._select_files(filelist, Data_File_Index)
+        n_files = len(self.filenames)
+        if n_files == 0:
+            raise RuntimeError(
+                "No data files selected in {}: {} usable file(s) and Data_File_Index={}. "
+                "Note [0,-1] leaves out the last file of the list{} - use "
+                "Data_File_Index=None for all of them.".format(
+                    self.Data_Directory, len(filelist), Data_File_Index,
+                    ' (on top of the newest file already skipped)' if skip_last_file else ''))
+        print("  --> Loading {} of {} files ({} ... {})".format(
+            n_files, len(filelist), self.filenames[0], self.filenames[-1]))
+
+        ## ---- first file: axes, product map, time anchor ----
+        with h5py.File(os.path.join(self.Data_Directory, self.filenames[0]), 'r') as fd:
+            self._layout = self._detect_layout(fd)
+            vis0 = self._read_vis(fd)
+            n_time, n_freq, n_prod_raw = vis0.shape
+            del vis0
+            self.freq, n_freq_full = self._read_freq(fd)
+            self._set_time_anchor(fd)
+            self.prod = self._product_map(fd, n_prod_raw)
+        self.n_freq_full = n_freq_full
+        self.n_inputs_hw = int(self.prod.max()) + 1
+        print("  --> Raw products per file: {} (from {} inputs)".format(
+            len(self.prod), self.n_inputs_hw))
+
+        ## ---- used ports + channel names from the site class ----
+        self._setup_ports(site_class)
+        self._setup_channels()
+
+        ## ---- gains ----
+        self._setup_gains(Load_Gains, Fix_Gains, Gain_Params, n_freq)
+
+        ## ---- offsets (crosses only) ----
+        self.offset_real = self.offset_imag = self._offset = None
+        if remove_real_imag_offset:
+            self._compute_offsets(filelist, offset_file_index, offset_time_samples)
+
+        ## ---- main loop ----
+        self.V = np.zeros((n_files, n_time, n_freq, self.n_channels), dtype=complex)
+        t = np.zeros((n_files, n_time))
+        self.sat = np.zeros((n_files, n_time, n_freq, self.n_ports))
+        valid = np.zeros((n_files, n_time), dtype=bool)
+        print("Assigning array values by reading in data files:")
+        for i, file in enumerate(self.filenames):
+            print("\r  --> Loading file {}/{}: {}".format(i + 1, n_files, file), end="")
+            try:
+                with h5py.File(os.path.join(self.Data_Directory, file), 'r') as fd_n:
+                    if fd_n['vis'].shape[0 if self._layout == 'tfp' else 2] == 0:
+                        print("\n  --> Skipping empty file: {}".format(file))
+                        continue
+                    chans, tm, sat = self._read_file(fd_n)
+            except (OSError, KeyError) as e:
+                print("\n  --> Skipping file {} ({})".format(file, e))
+                continue
+            ## files cut off mid-write can have vis / time / sat of different lengths
+            nt = min(chans.shape[0], len(tm), n_time)
+            if nt != n_time or chans.shape[0] != len(tm):
+                print("\n  --> File {}: {} integrations of vis, {} time stamps (expected {}); "
+                      "keeping {}.".format(file, chans.shape[0], len(tm), n_time, nt))
+            if self._offset is not None:
+                chans[:, :, self.cross_idx] -= self._offset[np.newaxis, :, :]
+            self.V[i, :nt] = chans[:nt]
+            t[i, :nt] = tm[:nt]
+            if sat is not None:
+                ns = min(nt, sat.shape[0])
+                self.sat[i, :ns] = sat[:ns]
+                if ns < nt:
+                    print("\n  --> File {}: saturation data has {} rows for {} integrations; "
+                          "missing rows left at 0.".format(file, sat.shape[0], nt))
+            valid[i, :nt] = True
+        print("\n  --> Finished. Reshaping arrays.")
+
+        ## ---- flatten files x time, drop skipped / missing integrations ----
+        valid = valid.reshape(-1)
+        self.V = self.V.reshape((n_files * n_time, n_freq, self.n_channels))[valid]
+        self.t = t.reshape(n_files * n_time)[valid]
+        self.sat = self.sat.reshape((n_files * n_time, n_freq, self.n_ports))[valid]
+        if (~valid).any():
+            print("  --> Dropped {} empty/missing integrations.".format(int((~valid).sum())))
+        self.t_rel = self.t - self.t[0] if len(self.t) else self.t
+        self.t_arr_datetime = np.array(
+            [datetime.datetime.fromtimestamp(x, pytz.utc) for x in self.t])
+        self.t_index = np.arange(len(self.t))
+        if len(self.t):
+            print("  --> Time: {} to {} UTC ({})".format(
+                self.t_arr_datetime[0].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                self.t_arr_datetime[-1].strftime('%H:%M:%S.%f')[:-3], self._time_desc))
+        print("  --> V shape (time, freq, channel): {}  [{}, {}]".format(
+            self.V.shape, _plural(len(self.auto_idx), 'auto'), _plural(len(self.cross_idx), 'cross')))
+
+        self._check_autos()
+        print()
+        self.print_channels()
+
+    ############################################################
+    # FILES AND LAYOUT
+    ############################################################
+    def _list_files(self, skip_last_file):
+        files = [x for x in os.listdir(self.Data_Directory)
+                 if ".lock" not in x and not x.startswith('.')
+                 and not os.path.isdir(os.path.join(self.Data_Directory, x))]
+        if self.instrument == 'CRS':
+            num = [x for x in files if x.split('.')[0].isdigit()]
+            other = sorted(set(files) - set(num))
+            if other:
+                print("  --> Ignoring non-numbered files: {}".format(', '.join(other)))
+            files = sorted(num, key=lambda x: int(x.split('.')[0]))
         else:
-            self._initialize_corr(
-                Data_Directory,
-                Gain_Directory,
-                site_class,
-                Data_File_Index,
-                Load_Gains,
-                Fix_Gains,
-                Apply_Gains,
-                Gain_Params,
-                fbounds,
-                use_ctime,
-                auto_only,
-                esystem,
-                remove_real_imag_offset,
-                offset_crossmap,
-                offset_file_index,
-                offset_time_samples,
-                offset_freq_index,
-                plot_offset_diagnostic,
-            )
+            files = sorted(files)
+        if skip_last_file and files:
+            print("  --> Skipping newest file {} (may still be being written; "
+                  "skip_last_file=False to keep it)".format(files[-1]))
+            files = files[:-1]
+        return files
 
-    def _initialize_corr(
-                self,
-                Data_Directory,
-                Gain_Directory,
-                site_class,
-                Data_File_Index,
-                Load_Gains,
-                Fix_Gains,
-                Apply_Gains,
-                Gain_Params,
-                fbounds,
-                use_ctime,
-                auto_only,
-                esystem,
-                remove_real_imag_offset,
-                offset_crossmap,
-                offset_file_index,
-                offset_time_samples,
-                offset_freq_index,
-                plot_offset_diagnostic,
-        ):
-            self.Data_Directory=Data_Directory
-            self.Gain_Directory=Gain_Directory
-            filelist=np.sort([x for x in os.listdir(self.Data_Directory) if ".lock" not in x])[:-1]
-            self.filenames=filelist[Data_File_Index[0]:Data_File_Index[1]]
-            n_files=len(self.filenames)
-            print('Initializing Correlator Class using:')
-            print("  --> "+self.Data_Directory)
-            fd=h5py.File(self.Data_Directory+self.filenames[0],'r')
-            self.fbounds=fbounds
-            flb=fbounds[0]
-            fub=fbounds[1]
-            vis=fd['vis'][:,flb:fub,:]
-            if 'CHIME' in site_class.name:
-                if esystem==True:
-                    Cevals=np.tile(np.array(fd['eval']).transpose(2,0,1)[:,:,:,np.newaxis][:,:,0,:],fd['evec'].shape[2])
-                    Cevecs=np.abs(np.array(fd['evec'][:,0,:,:]).transpose(2,0,1))**2.0
-                    vis=Cevals*Cevecs
+    @staticmethod
+    def _select_files(filelist, idx):
+        if idx is None:
+            return list(filelist)
+        if isinstance(idx, slice):
+            return list(filelist[idx])
+        idx = list(np.atleast_1d(idx))
+        if len(idx) == 2:
+            return list(filelist[idx[0]:idx[1]])
+        return [filelist[int(i)] for i in idx]
+
+    def _detect_layout(self, fd):
+        """'tfp' (time, freq, product) or 'fpt' (freq, product, time, CHIME-style),
+        from the file's own axis lengths."""
+        if self.instrument == 'CRS':
+            return 'tfp'
+        shp = fd['vis'].shape
+        n_f = fd['index_map']['freq'].shape[0]
+        if shp[1] == n_f:
+            return 'tfp'
+        if shp[0] == n_f:
+            print("  --> vis stored as (freq, prod, time); transposing")
+            return 'fpt'
+        raise RuntimeError("Can't match vis shape {} to {} frequency channels".format(shp, n_f))
+
+    def _read_vis(self, fd):
+        """Raw visibilities as (time, freq, raw product), frequency-sliced."""
+        flb, fub = self.fbounds
+        if self.esystem:
+            Cevals = np.tile(np.array(fd['eval']).transpose(2, 0, 1)[:, :, :, np.newaxis][:, :, 0, :],
+                             fd['evec'].shape[2])
+            Cevecs = np.abs(np.array(fd['evec'][:, 0, :, :]).transpose(2, 0, 1)) ** 2.0
+            return _to_complex(Cevals * Cevecs)[:, flb:fub, :]
+        if self._layout == 'fpt':
+            return _to_complex(fd['vis'][flb:fub]).transpose(2, 0, 1)
+        return _to_complex(fd['vis'][:, flb:fub, :])
+
+    def _read_freq(self, fd):
+        flb, fub = self.fbounds
+        f = fd['index_map']['freq']
+        n_full = f.shape[0]
+        if fub > n_full or flb < 0 or flb >= fub:
+            raise ValueError("fbounds {} outside the {} channels in the data".format(
+                self.fbounds, n_full))
+        if f.dtype.names is not None:          # ICE: structured (centre, width)
+            return np.array([x[0] for x in f[flb:fub]]), n_full
+        return np.array(f[flb:fub]), n_full
+
+    ############################################################
+    # TIME
+    ############################################################
+    def _set_time_anchor(self, fd):
+        if self.instrument == 'CRS':
+            self._time_desc = 'CRS UNIX timestamps'
+            return
+        names = fd['index_map']['time'].dtype.names or ()
+        src = self.time_source
+        if src == 'fpga' and 'fpga_count' not in names:
+            print("  --> No fpga_count in file; using irigb_time per integration")
+            src = 'irigb'
+        need = {'fpga': 'ctime' if self.use_ctime else 'irigb_time',
+                'irigb': 'irigb_time', 'ctime': 'ctime'}[src]
+        if need not in names:
+            raise KeyError("time_source='{}' needs '{}' in index_map/time (has {})".format(
+                src, need, names))
+        self._time_src = src
+        tmap = fd['index_map']['time']
+        if src == 'fpga':
+            self._fpga0 = float(tmap['fpga_count'][0])
+            self._tanchor = float(tmap['ctime'][0]) if self.use_ctime \
+                else 1e-9 * float(tmap['irigb_time'][0])
+            self._time_desc = 'FPGA counts anchored to {} of first integration'.format(
+                'ctime' if self.use_ctime else 'IRIG-B')
+        else:
+            self._time_desc = '{} per integration'.format(src)
+        self.t0 = self._tanchor if src == 'fpga' else None
+
+    def _read_times(self, fd):
+        """UNIX seconds for every integration in this file."""
+        if self.instrument == 'CRS':
+            return np.array(fd['index_map']['time'], dtype=float)
+        tmap = fd['index_map']['time']
+        if self._time_src == 'fpga':
+            return self._tanchor + FPGA_SECONDS_PER_COUNT * (
+                np.array(tmap['fpga_count'], dtype=float) - self._fpga0)
+        if self._time_src == 'irigb':
+            return 1e-9 * np.array(tmap['irigb_time'], dtype=float)
+        return np.array(tmap['ctime'], dtype=float)
+
+    ############################################################
+    # PRODUCT MAP
+    ############################################################
+    def _product_map(self, fd, n_prod_raw):
+        """(n_prod_raw, 2) physical input pair of each raw product."""
+        if self.instrument == 'CRS':
+            if n_prod_raw != len(CRS_PROD):
+                raise RuntimeError("Expected {} CRS products, but vis has {}".format(
+                    len(CRS_PROD), n_prod_raw))
+            print("  --> Product map: built-in CRS table (36 products, 8 inputs)")
+            return CRS_PROD.copy()
+        if self.esystem:
+            print("  --> Product map: eigen-system mode, one column per input")
+            return np.array([[i, i] for i in range(n_prod_raw)], dtype=int)
+        n_in = _n_inputs_from_n_prod(n_prod_raw)
+        expected = ice_prod_map(n_in) if n_in is not None else None
+        file_prod = None
+        try:
+            p = fd['index_map']['prod'][:]
+            file_prod = np.array([[int(x[0]), int(x[1])] for x in p], dtype=int)
+        except KeyError:
+            pass
+        if file_prod is not None and len(file_prod) == n_prod_raw:
+            if expected is not None and np.array_equal(file_prod, expected):
+                print("  --> Product map: standard ICEBoard order, inputs 0-{} "
+                      "(matches the file's index_map/prod)".format(n_in - 1))
+            else:
+                print("  --> WARNING: the file's index_map/prod isn't the standard ICEBoard "
+                      "order; using the file's map.")
+            return file_prod
+        if expected is None:
+            raise RuntimeError("ICEBoard file has {} products (not N(N+1)/2 for any N) and no "
+                               "usable index_map/prod.".format(n_prod_raw))
+        print("  --> Product map: standard ICEBoard order, inputs 0-{} "
+              "(file has no index_map/prod)".format(n_in - 1))
+        return expected
+
+    ############################################################
+    # PORTS AND CHANNELS
+    ############################################################
+    def _setup_ports(self, site_class):
+        chmap = np.atleast_1d(np.array(site_class.chmap)).astype(int)
+        n_used = getattr(site_class, 'n_channels', None)
+        if n_used is not None:
+            n_used = int(np.squeeze(n_used))
+            if n_used > len(chmap):
+                raise ValueError("site_class.n_channels={} but chmap only lists {} ports".format(
+                    n_used, len(chmap)))
+            chmap = chmap[:n_used]
+        if len(set(chmap.tolist())) != len(chmap):
+            raise ValueError("site_class.chmap repeats a port: {}".format(chmap.tolist()))
+        bad = [int(p) for p in chmap if p < 0 or p >= self.n_inputs_hw]
+        if bad:
+            raise ValueError("chmap port(s) {} not in this data: the {} recorded inputs 0-{} "
+                             "only.".format(bad, INSTRUMENT_LONGNAME[self.instrument],
+                                            self.n_inputs_hw - 1))
+        self.chmap = chmap
+        self.n_ports = len(chmap)
+        self.n_dishes = self.n_ports            # as in corr_crs_mod_draft
+
+        keys = None
+        for attr in ('keystrings', 'keystring', 'Keystrings', 'KeyStrings', 'key_strings'):
+            if hasattr(site_class, attr) and not callable(getattr(site_class, attr)):
+                keys = getattr(site_class, attr)
+                break
+        if keys is None:
+            print("  --> WARNING: no keystrings in site class; naming ports 'ch(N)'.")
+            keys = ['ch'] * self.n_ports
+        keys = [k.decode() if isinstance(k, bytes) else str(k) for k in np.atleast_1d(keys)]
+        if len(keys) < self.n_ports:
+            raise ValueError("site class has {} keystrings for {} used ports".format(
+                len(keys), self.n_ports))
+        self.keystrings = keys[:self.n_ports]
+        self.port_labels = ['{}({})'.format(k, p) for k, p in zip(self.keystrings, self.chmap)]
+
+        # dish of each port, if the site file says (site_utils v2 / inferred for old files)
+        self.port_dish = [None] * self.n_ports
+        c2d = getattr(site_class, 'chmap_to_dishes', None)
+        dn = getattr(site_class, 'dish_names', None)
+        if c2d is not None and dn is not None and len(c2d) >= self.n_ports:
+            self.port_dish = [str(dn[int(d)]) for d in np.asarray(c2d)[:self.n_ports]]
+        print("  --> Used ports: " + ', '.join(self.port_labels))
+
+        self.automap = np.zeros(self.n_ports, dtype=int)     # raw auto product of each port
+        for i, p in enumerate(self.chmap):
+            m = np.where((self.prod[:, 0] == p) & (self.prod[:, 1] == p))[0]
+            if len(m) == 0:
+                raise RuntimeError("No auto-correlation product for port {}".format(p))
+            self.automap[i] = m[0]
+
+    def _setup_channels(self):
+        """Every pair (i <= j) of used ports, in chmap order."""
+        names, ports, keys, raw, conj, dishes = [], [], [], [], [], []
+        for i in range(self.n_ports):
+            for j in range(i, self.n_ports):
+                pa, pb = int(self.chmap[i]), int(self.chmap[j])
+                fwd = np.where((self.prod[:, 0] == pa) & (self.prod[:, 1] == pb))[0]
+                rev = np.where((self.prod[:, 0] == pb) & (self.prod[:, 1] == pa))[0]
+                if len(fwd):
+                    raw.append(int(fwd[0])); conj.append(False)
+                elif len(rev):
+                    raw.append(int(rev[0])); conj.append(True)   # stored as pb x pa
                 else:
-                    vis=np.array(fd['vis']).transpose(2,0,1)[:,flb:fub,:]
-            if use_ctime==False:
-                self.t0=1e-9*fd['index_map']['time']['irigb_time'][0]
-            if use_ctime==True:
-                self.t0=fd['index_map']['time']['ctime'][0]
-                corrtoff=(2.56e-6)*fd['index_map']['time']['fpga_count'][0]
-            self.freq=np.array([i[0] for i in fd['index_map']['freq'][flb:fub]])
+                    raise RuntimeError("No product for ports {} x {}".format(pa, pb))
+                names.append('{} x {}'.format(self.port_labels[i], self.port_labels[j]))
+                ports.append([pa, pb])
+                keys.append([self.keystrings[i], self.keystrings[j]])
+                dishes.append([self.port_dish[i], self.port_dish[j]])
+        self.chnames = ChannelNames(names, array='V')
+        self.chan_ports = np.array(ports, dtype=int)      # physical ports, name order
+        self.chan_keys = np.array(keys)                    # keystrings, name order
+        self.chan_dishes = dishes
+        self.chan_raw_idx = np.array(raw, dtype=int)       # raw product index in the file
+        self.chan_conj = np.array(conj, dtype=bool)        # conjugated on load
+        self.chan_is_auto = self.chan_ports[:, 0] == self.chan_ports[:, 1]
+        self.n_channels = len(names)                       # channels in V (draft meaning)
+        self.n_chans = self.n_channels
 
-            self.prod=fd['index_map']['prod'][:]
-            prodmat=np.array([element for tupl in self.prod for element in tupl]).reshape(len(self.prod),2)
-            ## Unified auto+cross channel model: n_ports is the number of
-            ## physical ports actually used (from site_class.chmap); chmap/
-            ## automap/gain/sat stay port-indexed (n_ports long). chan_prod/
-            ## chan_is_auto/self.V are one flat, non-repeating list covering
-            ## every saved product between two used ports (auto included by
-            ## default -- pass auto_only=True in Corr_Data.__init__ to
-            ## restrict to autos only):
-            n_ports=min(len(site_class.chmap),int(prodmat[:,0].max()+1))
-            self.chmap=np.array(site_class.chmap[:n_ports]).astype(int)
-            used_ports=set(self.chmap.tolist())
-            self.automap=np.zeros(n_ports).astype(int)
-            for i,j in enumerate(self.chmap):
-                self.automap[i]=np.intersect1d(np.where(prodmat[:,0]==j),np.where(prodmat[:,1]==j))[0]
-            keep_idx=[]
-            for k,(a,b) in enumerate(prodmat):
-                if a in used_ports and b in used_ports:
-                    if auto_only and a!=b:
-                        continue
-                    keep_idx.append(k)
-            keep_idx=np.array(keep_idx,dtype=int)
-            self.keep_idx=keep_idx
-            self.n_channels=len(keep_idx)
-            self.n_dishes=len(self.chmap)
-            self.chan_prod=prodmat[keep_idx]
-            self.chan_is_auto=self.chan_prod[:,0]==self.chan_prod[:,1]
-            self.V=np.zeros((n_files,vis.shape[0],vis.shape[1],self.n_channels)).astype(complex)
-            self.t=np.zeros((n_files,vis.shape[0]))
-            self.sat=np.zeros((n_files,vis.shape[0],vis.shape[1],n_ports))
-            self.gainfile=os.listdir(self.Gain_Directory)[0]
-            digital_gain=np.ones((len(self.freq),n_ports))
-            self.gain_coeffs=np.ones(len(self.freq))
-            self.gain_exp=np.ones(vis.shape[2])
-            if Load_Gains==True:
-                try:
-                    fg=h5py.File(self.Gain_Directory+self.gainfile,'r')
-                    self.gain_coeffs=fg['gain_coeff'][0]
-                    self.gain_exp=fg['gain_exp'][0]
-                    digital_gain=fg['gain_coeff'][0]
-                    digital_gain*=np.power(2,fg['gain_exp'][0])[np.newaxis,:]
-                    fg.close()
-                except OSError:
-                    print("  --> ERROR: Gain file not found")
-            if Fix_Gains==True:
-                digital_gain=Gain_Params[0]*np.array((2**Gain_Params[1])*np.ones((vis.shape[1],n_ports))).astype(complex)
-                self.gain_coeffs=Gain_Params[0]*np.ones(len(self.freq))
-                self.gain_exp=Gain_Params[1]*np.ones(vis.shape[2])
-            self.gain=digital_gain.real[flb:fub,:]
-            fd.close()
-            ############################################################
-            # OFFSET ESTIMATION (NEW BLOCK — FROM YOUR SCRIPT)
-            ############################################################
-            real_offset=None
-            imag_offset=None
-            if remove_real_imag_offset and len(offset_crossmap)>0:
-                print("\nComputing offsets using reference file:",offset_file_index)
-                offset_file=filelist[offset_file_index]
-                fd_offset=h5py.File(self.Data_Directory+offset_file,'r')
-                vis_offset=fd_offset['vis'][:,flb:fub,:]
-                n_offset_time=min(offset_time_samples,vis_offset.shape[0])
-                vis_subset=vis_offset[:n_offset_time,:,offset_crossmap]
-                if Apply_Gains:
-                    for ci,k in enumerate(offset_crossmap):
-                        prod_pair=self.prod[k]
-                        g1=self.gain[:,prod_pair[0]]
-                        g2=self.gain[:,prod_pair[1]]
-                        vis_subset[:,:,ci]/=(g1*g2)[np.newaxis,:]
-                real_offset=np.median(vis_subset.real,axis=0)
-                imag_offset=np.median(vis_subset.imag,axis=0)
-                fd_offset.close()
-            ############################################################
-            # MAIN FILE LOOP (ORIGINAL STRUCTURE)
-            ############################################################
-            print("Assigning array values by reading in data files:")
-            for i,file in enumerate(self.filenames):
-                try:
-                    print("\r  --> Loading File: {}/{}".format(self.filenames[i],self.filenames[-1]),end="")
-                    fd_n=h5py.File(self.Data_Directory+file,'r')
-                    vis=fd_n['vis'][:,flb:fub,:]
-                    if 'CHIME' in site_class.name:
-                        if esystem==True:
-                            Cevals=np.tile(np.array(fd_n['eval']).transpose(2,0,1)[:,:,:,np.newaxis][:,:,0,:],fd_n['evec'].shape[2])
-                            Cevecs=np.abs(np.array(fd_n['evec'][:,0,:,:]).transpose(2,0,1))**2.0
-                            vis=Cevals*Cevecs
-                        else:
-                            vis=np.array(fd_n['vis']).transpose(2,0,1)[:,flb:fub,:]
-                    tm=(2.56e-6)*np.array(fd_n['index_map']['time']['fpga_count'])-corrtoff
-                    if use_ctime==False:
-                        tm=np.array(fd_n['index_map']['time']['irigb_time'])
-                    prod=fd_n['index_map']['prod'][:]
-                    ################################################
-                    # APPLY GAINS
-                    ################################################
-                    if Apply_Gains:
-                        for ii,pp in enumerate(prod):
-                            vis[:,:,ii]/=(self.gain[:,pp[0]]*self.gain[:,pp[1]])[np.newaxis,:]
-                    ################################################
-                    # OPTIONAL REAL/IMAG OFFSET REMOVAL -- raw product index
-                    # space, BEFORE channel selection below, so it applies
-                    # uniformly regardless of whether that raw product ends
-                    # up kept as an auto or cross channel:
-                    ################################################
-                    if remove_real_imag_offset:
-                        for oi,k in enumerate(offset_crossmap):
-                            vis[:,:,k]=(vis[:,:,k].real-real_offset[:,oi][np.newaxis,:]) \
-                                      +1j*(vis[:,:,k].imag-imag_offset[:,oi][np.newaxis,:])
-                    ################################################
-                    # POPULATE SATURATION (port-indexed, unchanged):
-                    ################################################
-                    for j,k in enumerate(self.automap):
-                        try:
-                            self.sat[i,:,:,j]=fd_n['sat'][:,flb:fub,k].real
-                        except KeyError:
-                            pass
-                    ################################################
-                    # POPULATE V: one flat, non-repeating list of every kept
-                    # auto+cross product (self.keep_idx / self.chan_prod),
-                    # complex-native -- downstream code takes np.abs():
-                    ################################################
-                    for j,k in enumerate(self.keep_idx):
-                        self.V[i,:,:,j]=vis[:,:,k]
-                    self.t[i,:]=tm
-                    fd_n.close()
-                except OSError:
-                    print('\nSkipping file: {}'.format(file))
-            print("\n  --> Finished. Reshaping arrays.")
-            ############################################################
-            # RESHAPING
-            ############################################################
-            self.V=self.V.reshape((n_files*vis.shape[0],vis.shape[1],self.n_channels))
-            self.t=self.t.reshape(n_files*vis.shape[0])
-            self.sat=self.sat.reshape((n_files*vis.shape[0],vis.shape[1],self.sat.shape[3]))
-            timedeltas=np.array([datetime.timedelta(seconds=x) for x in self.t])
-            dt0=datetime.datetime.fromtimestamp(self.t0,pytz.timezone('America/Montreal')).astimezone(pytz.utc)
-            self.t_arr_datetime=dt0+timedeltas
-            if 'CHIME' in site_class.name:
-                self.t_arr_datetime=np.array([datetime.datetime.fromtimestamp(x,pytz.utc) for x in self.t])
-            if 'D3A' in site_class.name:
-                self.t_arr_datetime=np.array([datetime.datetime.fromtimestamp(1e-9*x,pytz.utc) for x in self.t])
-            self.t_index=np.arange(len(self.t))
+        ## index maps between V and the auto / cross sub-arrays
+        self.auto_idx = np.where(self.chan_is_auto)[0]     # V index of V_auto[k]
+        self.cross_idx = np.where(~self.chan_is_auto)[0]   # V index of V_cross[k]
+        self.chan_sub_idx = np.zeros(self.n_channels, dtype=int)   # V index -> sub-array index
+        self.chan_sub_idx[self.auto_idx] = np.arange(len(self.auto_idx))
+        self.chan_sub_idx[self.cross_idx] = np.arange(len(self.cross_idx))
+        self.auto_names = ChannelNames([names[k] for k in self.auto_idx], array='V_auto')
+        self.cross_names = ChannelNames([names[k] for k in self.cross_idx], array='V_cross')
 
+        rows = []
+        for k in range(self.n_channels):
+            da, db = dishes[k]
+            if self.chan_is_auto[k]:
+                typ = 'auto'
+            elif da is not None and da == db:
+                typ = 'cross, same dish'
+            else:
+                typ = 'cross'
+            rows.append(dict(
+                V=k,
+                V_auto=int(self.chan_sub_idx[k]) if self.chan_is_auto[k] else None,
+                V_cross=None if self.chan_is_auto[k] else int(self.chan_sub_idx[k]),
+                name=names[k], type=typ,
+                port_a=ports[k][0], port_b=ports[k][1],
+                key_a=keys[k][0], key_b=keys[k][1],
+                dish_a=da, dish_b=db,
+                raw_prod=raw[k], conjugated=conj[k]))
+        self.channel_table = pandas.DataFrame(rows).set_index('V')
+        for c in ('V_auto', 'V_cross'):
+            self.channel_table[c] = self.channel_table[c].astype('Int64')
+        ## older-draft aliases
+        self.keep_idx = self.chan_raw_idx
+        self.chan_prod = self.chan_ports
 
-    def _initialize_crs(
-                self,
-                Data_Directory,
-                Gain_Directory,
-                site_class,
-                Data_File_Index,
-                Load_Gains,
-                Fix_Gains,
-                Apply_Gains,
-                Gain_Params,
-                fbounds,
-                auto_only,
-                esystem,
-                remove_real_imag_offset,
-                offset_crossmap,
-                offset_file_index,
-                offset_time_samples,
-                offset_freq_index,
-                plot_offset_diagnostic,
-        ):
-            self.Data_Directory=Data_Directory
-            self.Gain_Directory=Gain_Directory
-
-            filelist = sorted(
-            [x for x in os.listdir(self.Data_Directory) if ".lock" not in x],
-            key=lambda x: int(x.split(".")[0]))
-
-            self.filenames=filelist[Data_File_Index[0]:Data_File_Index[1]]
-            n_files=len(self.filenames)
-            print('Initializing Correlator Class using:')
-            print("  --> "+self.Data_Directory)
-            fd=h5py.File(self.Data_Directory+self.filenames[0],'r')
-            self.fbounds=fbounds
-            flb=fbounds[0]
-            fub=fbounds[1]
-            ############################################################
-            # READ FIRST FILE / INITIALIZE ARRAYS
-            ############################################################
-            # CRS visibilities are already stored as:
-            # (time, frequency, product)
-            vis = fd['vis'][:, flb:fub, :]
-            # Absolute UNIX timestamp of first integration
-            self.t0 = fd['index_map']['time'][0]
-            # Full (unbounded) frequency axis length, needed below to figure
-            # out whether a gain file covers the whole band or was already
-            # pre-truncated to [flb:fub]:
-            n_freq_full = fd['index_map']['freq'].shape[0]
-            # Frequency axis (already 1D for CRS)
-            self.freq = np.array(fd['index_map']['freq'][flb:fub])
-            ############################################################
-            # CRS PRODUCT MAP
-            #
-            # The CRS board currently writes all 36 visibility products,
-            # but the HDF5 index_map/prod dataset is not populated
-            # correctly, so we define the ordering explicitly.
-            ############################################################
-            self.prod = np.array([
-                [0,0],
-                [0,1],
-                [0,2],
-                [0,3],
-                [1,1],
-                [1,2],
-                [1,3],
-                [1,4],
-                [2,2],
-                [2,3],
-                [2,4],
-                [2,5],
-                [3,3],
-                [3,4],
-                [3,5],
-                [3,6],
-                [4,4],
-                [4,5],
-                [4,6],
-                [4,7],
-                [5,5],
-                [5,6],
-                [5,7],
-                [0,4],
-                [6,6],
-                [6,7],
-                [0,5],
-                [1,5],
-                [7,7],
-                [0,6],
-                [1,6],
-                [2,6],
-                [0,7],
-                [1,7],
-                [2,7],
-                [3,7]
-            ], dtype=int)
-
-            if vis.shape[2] != len(self.prod):
-                raise RuntimeError(
-                    f"Expected 36 CRS products, but vis has {vis.shape[2]}"
-                )
-            ############################################################
-            # CHANNELS USED IN THIS OBSERVATION
-            #
-            # Unified auto+cross channel model: n_ports is the number of
-            # physical CRS ports actually used (from site_class.chmap);
-            # chmap/automap/sat stay port-indexed (n_ports long).
-            # chan_prod/chan_is_auto/self.V are one flat, non-repeating list
-            # covering every one of the 36 saved products between two used
-            # ports (auto included by default -- pass auto_only=True in
-            # Corr_Data.__init__ to restrict to autos only).
-            ############################################################
-            n_ports = len(site_class.chmap)
-            self.chmap = np.array(site_class.chmap[:n_ports]).astype(int)
-            used_ports = set(self.chmap.tolist())
-            ############################################################
-            # FIND AUTO-CORRELATION PRODUCT FOR EACH PORT (sat lookup only)
-            ############################################################
-            self.automap = np.zeros(n_ports, dtype=int)
-            for i, ch in enumerate(self.chmap):
-                matches = np.where(
-                    (self.prod[:,0] == ch) &
-                    (self.prod[:,1] == ch)
-                )[0]
-                if len(matches) == 0:
-                    raise RuntimeError(
-                        f"No auto-correlation found for channel {ch}"
-                    )
-                self.automap[i] = matches[0]
-            ############################################################
-            # FLAT AUTO+CROSS CHANNEL LIST
-            ############################################################
-            keep_idx = []
-            for k, (a, b) in enumerate(self.prod):
-                if a in used_ports and b in used_ports:
-                    if auto_only and a != b:
-                        continue
-                    keep_idx.append(k)
-            keep_idx = np.array(keep_idx, dtype=int)
-            self.keep_idx = keep_idx
-            self.n_channels = len(keep_idx)
-            self.n_dishes = n_ports
-            self.chan_prod = self.prod[keep_idx]
-            self.chan_is_auto = self.chan_prod[:,0] == self.chan_prod[:,1]
-            ############################################################
-            # PRE-ALLOCATE OUTPUT ARRAYS
-            ############################################################
-            n_time = vis.shape[0]
-            n_freq = vis.shape[1]
-            self.V = np.zeros(
-                (n_files, n_time, n_freq, self.n_channels),
-                dtype=complex
-            )
-            self.t = np.zeros(
-                (n_files, n_time)
-            )
-            self.sat = np.zeros(
-                (n_files, n_time, n_freq, n_ports)
-            )
-            # CRS convention (confirmed from real data): Gain_Directory is
-            # the path to one specific per-acquisition .npy file, already
-            # chosen by the caller (e.g. gaindir = gdir + '<file>.npy' in
-            # the analysis notebook) -- NOT a folder to search, since CRS
-            # gains are one-per-acquisition rather than one-per-channel.
-            self.gainfile = os.path.basename(self.Gain_Directory)
-            ############################################################
-            # LOAD CRS DIGITAL GAINS (.npy)
-            #
-            # Unlike the iceboard's gain_coeff/gain_exp h5 pair, CRS digital
-            # gains are a single plain real-valued .npy array, shape
-            # (n_channels_hw, n_freq_full) -- confirmed 8x8192 in the field.
-            #
-            # IMPORTANT: n_channels_hw (the number of physical CRS board
-            # inputs, i.e. the range of indices used in self.prod above) is
-            # NOT the same thing as n_ports (len(site_class.chmap), the
-            # subset of physical ports THIS analysis cares about -- e.g. 4 of
-            # the 8 physical inputs for a given flight) -- and it's not
-            # self.n_channels either, which is now a *product* count (every
-            # kept auto+cross channel), not a port count at all. self.gain
-            # is indexed below by raw self.prod entries (0..n_channels_hw-1),
-            # so it must always be sized to all physical inputs, regardless
-            # of how many of them site_class.chmap actually uses.
-            #
-            # CRS gain files also store their frequency axis in the FPGA's
-            # native bit-reversed FFT bin order rather than natural
-            # ascending frequency order (confirmed 08/2026 -- this is what
-            # made early gain-vs-frequency plots look like scrambled noise
-            # instead of a smooth bandpass). bin_map below undoes that
-            # permutation. It's only valid across the complete 8192-channel
-            # band, so it must be applied BEFORE any [flb:fub] slicing.
-            ############################################################
-            n_channels_hw = int(self.prod.max()) + 1  # physical CRS inputs (8)
-            self.gain = np.ones((len(self.freq), n_channels_hw))
-            self.gain_coeffs = np.ones(len(self.freq))
-            self.gain_exp = np.ones(vis.shape[2])
+    ############################################################
+    # GAINS
+    ############################################################
+    def _setup_gains(self, Load_Gains, Fix_Gains, Gain_Params, n_freq):
+        """self.gain: (freq, input) real gain, indexed by PHYSICAL input number."""
+        self.gain = np.ones((n_freq, self.n_inputs_hw))
+        self.gain_coeffs = np.ones(n_freq)
+        self.gain_exp = np.ones(self.n_inputs_hw)
+        self.gainfile = None
+        self.gains_loaded = False
+        if Fix_Gains:
             if Load_Gains:
-                try:
-                    if os.path.isdir(self.Gain_Directory):
-                        raise ValueError(
-                            "Gain_Directory is a directory ({}); CRS gain "
-                            "files are one-per-acquisition, not one-per-"
-                            "channel -- point Gain_Directory at the exact "
-                            ".npy file for this acquisition instead (e.g. "
-                            "gaindir = gdir + '<specific_file>.npy').".format(
-                                self.Gain_Directory
-                            )
-                        )
-                    digital_gain = np.load(self.Gain_Directory, allow_pickle=True)
-                    if digital_gain.shape == (n_channels_hw, n_freq_full):
-                        digital_gain = digital_gain.T
-                    elif digital_gain.shape != (n_freq_full, n_channels_hw):
-                        raise ValueError(
-                            "CRS gain array has shape {}, expected ({}, {}) "
-                            "or ({}, {}).".format(
-                                digital_gain.shape,
-                                n_channels_hw, n_freq_full,
-                                n_freq_full, n_channels_hw,
-                            )
-                        )
-                    if n_freq_full != 8192:
-                        raise ValueError(
-                            "CRS bin descrambling below is hardcoded for an "
-                            "8192-channel band, but n_freq_full={}. Refusing "
-                            "to silently apply a mismatched permutation.".format(
-                                n_freq_full
-                            )
-                        )
-                    # Undo the FPGA's bit-reversed frequency bin ordering:
-                    f_nat = np.arange(n_freq_full)
-                    f_rev = (f_nat >> 11) | ((f_nat & 0b11111111111) << 2)
-                    bin_map = (f_rev & 0b1111111111100) | ((f_rev + f_nat) & 0b11)
-                    digital_gain = digital_gain[bin_map, :]
-                    self.gain = digital_gain.real[flb:fub, :]
-                except (OSError, ValueError) as e:
-                    print("  --> ERROR: CRS gain file not loaded:", e)
-                    print("  --> Falling back to unity gains (Apply_Gains will be a no-op).")
-            if Fix_Gains:
-                digital_gain = Gain_Params[0]*np.array(
-                    (2**Gain_Params[1])*np.ones((n_freq, n_channels_hw))
-                ).astype(complex)
-                self.gain_coeffs = Gain_Params[0]*np.ones(len(self.freq))
-                self.gain_exp = Gain_Params[1]*np.ones(vis.shape[2])
-                self.gain = digital_gain.real
-            fd.close()
-            ############################################################
-            # OFFSET ESTIMATION (NEW BLOCK)
-            ############################################################
-            real_offset = None
-            imag_offset = None
-            if remove_real_imag_offset and len(offset_crossmap) > 0:
-                print("\nComputing offsets using reference file:", offset_file_index)
-                offset_file = filelist[offset_file_index]
-                fd_offset = h5py.File(self.Data_Directory + offset_file, 'r')
-                # Read visibilities from reference file
-                vis_offset = fd_offset['vis'][:, flb:fub, :]
-                # Number of integrations to use for offset estimation
-                n_offset_time = min(offset_time_samples, vis_offset.shape[0])
-                # Select only requested cross-correlations
-                vis_subset = vis_offset[:n_offset_time, :, offset_crossmap].astype(np.complex128)
-                # Optionally apply gains before estimating offsets
-                if Apply_Gains:
-                    for ci, k in enumerate(offset_crossmap):
-                        prod_pair = self.prod[k]
-                        g1 = self.gain[:, prod_pair[0]]
-                        g2 = self.gain[:, prod_pair[1]]
-                        vis_subset[:, :, ci] /= (g1 * g2)[np.newaxis, :]
-                # Median real/imaginary offset for every frequency and baseline
-                real_offset = np.median(vis_subset.real, axis=0)
-                imag_offset = np.median(vis_subset.imag, axis=0)
-                print("Computed complex offsets using {} integrations.".format(n_offset_time))
-                fd_offset.close()
-             ############################################################
-            # MAIN FILE LOOP (CRS STRUCTURE)
-            ############################################################
-            print("Assigning array values by reading in data files:")
-            for i, file in enumerate(self.filenames):
-                try:
-                    print("\r  --> Loading File {}/{}".format(i+1, n_files), end="")
-                    fd_n = h5py.File(self.Data_Directory + file, 'r')
-                    if fd_n['vis'].shape[0] == 0:
-                        print("\nSkipping incomplete file:", file)
-                        fd_n.close()
-                        continue
-                    vis = fd_n['vis'][:, flb:fub, :]
-                    ################################################
-                    # APPLY GAINS (mirrors _initialize_corr; previously
-                    # missing entirely from the CRS branch, so gains were
-                    # loaded/offset-corrected-for but never actually
-                    # divided out of the visibilities)
-                    ################################################
-                    if Apply_Gains:
-                        for ii, pp in enumerate(self.prod):
-                            vis[:,:,ii] /= (self.gain[:,pp[0]]*self.gain[:,pp[1]])[np.newaxis,:]
-                    ################################################
-                    # OPTIONAL REAL/IMAG OFFSET REMOVAL -- raw product index
-                    # space, BEFORE channel selection below, so it applies
-                    # uniformly regardless of whether that raw product ends
-                    # up kept as an auto or cross channel:
-                    ################################################
-                    if remove_real_imag_offset:
-                        for oi,k in enumerate(offset_crossmap):
-                            vis[:,:,k]=(vis[:,:,k].real-real_offset[:,oi][np.newaxis,:]) \
-                                      +1j*(vis[:,:,k].imag-imag_offset[:,oi][np.newaxis,:])
-                    ################################################
-                    # CRS TIME ARRAY
-                    ################################################
-                    tm = np.array(fd_n['index_map']['time'])
-                    ################################################
-                    # POPULATE SATURATION (port-indexed, unchanged):
-                    ################################################
-                    for j, k in enumerate(self.automap):
-                        try:
-                            sat_data = fd_n['sat'][:, flb:fub, k].real
-                            if sat_data.shape == self.sat[i, :, :, j].shape:
-                                self.sat[i, :, :, j] = sat_data
-                            else:
-                                print("\nSkipping sat for incomplete file:", file)
-                        except KeyError:
-                            pass
-                    ################################################
-                    # POPULATE V: one flat, non-repeating list of every kept
-                    # auto+cross product (self.keep_idx / self.chan_prod),
-                    # complex-native -- downstream code takes np.abs():
-                    ################################################
-                    for j,k in enumerate(self.keep_idx):
-                        self.V[i,:,:,j]=vis[:,:,k]
-                    self.t[i,:]=tm
-                    fd_n.close()
-                except OSError:
-                    print('\nSkipping file: {}'.format(file))
-            print("\n  --> Finished. Reshaping arrays.")
-            ############################################################
-            # RESHAPE ARRAYS
-            ############################################################
-            self.V = self.V.reshape(
-                (n_files * n_time, n_freq, self.n_channels)
-            )
-            self.t = self.t.reshape(
-                n_files * n_time
-            )
-            self.sat = self.sat.reshape(
-                (n_files * n_time, n_freq, self.sat.shape[3])
-            )
-            ############################################################
-            # CRS TIMESTAMPS
-            #
-            # CRS time is already UNIX seconds
-            ############################################################
-            self.t_arr_datetime = np.array(
-                [
-                    datetime.datetime.fromtimestamp(x, pytz.utc)
-                    for x in self.t
-                ]
-            )
-            self.t_index = np.arange(len(self.t))
+                print("  --> Fix_Gains=True: using fixed gains, gain file not read")
+            g = Gain_Params[0] * (2.0 ** Gain_Params[1])
+            self.gain = g * np.ones((n_freq, self.n_inputs_hw))
+            self.gain_coeffs = Gain_Params[0] * np.ones(n_freq)
+            self.gain_exp = Gain_Params[1] * np.ones(self.n_inputs_hw)
+            self.gains_loaded = True
+            print("  --> Gains: fixed at {} x 2^{} for every input".format(*Gain_Params))
+        elif Load_Gains:
+            self.gains_loaded = self._load_crs_gains() if self.instrument == 'CRS' \
+                else self._load_ice_gains()
+        else:
+            print("  --> Gains: not loaded (Load_Gains=False)")
+        if self.Apply_Gains:
+            print("  --> Applying gains: {}".format(
+                'yes, V_ab / (g_a * g_b)' if self.gains_loaded
+                else 'NO GAINS AVAILABLE - data left in raw correlator units'))
+        else:
+            print("  --> Applying gains: no (Apply_Gains=False)")
+
+    def _load_ice_gains(self):
+        """ICEBoard .h5: g = gain_coeff[0] * 2**gain_exp[0], (n_freq_full, 16)."""
+        flb, fub = self.fbounds
+        try:
+            path = self.Gain_Directory
+            if path is None:
+                raise OSError("Gain_Directory is None")
+            if os.path.isdir(path):
+                cands = sorted(x for x in os.listdir(path)
+                               if x.lower().endswith(('.h5', '.hdf5')) and not x.startswith('.'))
+                if not cands:
+                    raise OSError("no .h5 gain file in {}".format(path))
+                if len(cands) > 1:
+                    print("  --> {} gain files in {}; using {} (give the file path to "
+                          "choose)".format(len(cands), path, cands[0]))
+                path = os.path.join(path, cands[0])
+            self.gainfile = os.path.basename(path)
+            with h5py.File(path, 'r') as fg:
+                coeff = _to_complex(fg['gain_coeff'][0])          # (n_freq_full, n_inputs)
+                exp = np.array(fg['gain_exp'][0], dtype=float)     # (n_inputs,)
+            g = coeff * np.power(2.0, exp)[np.newaxis, :]
+            if g.shape[0] != self.n_freq_full:
+                raise ValueError("gain file has {} frequencies, data has {}".format(
+                    g.shape[0], self.n_freq_full))
+            if g.shape[1] < self.n_inputs_hw:
+                raise ValueError("gain file has {} inputs, data has {}".format(
+                    g.shape[1], self.n_inputs_hw))
+            if np.max(np.abs(g.imag)) > 1e-6 * max(np.max(np.abs(g.real)), 1e-300):
+                print("  --> NOTE: gains have an imaginary part; like the original corr.py, "
+                      "only the real part is used.")
+            self.gain = g.real[flb:fub, :self.n_inputs_hw]    # first N inputs = recorded ones
+            self.gain_coeffs, self.gain_exp = coeff, exp
+            print("  --> Gains: loaded {} ({} inputs in file, {} used by the data)".format(
+                self.gainfile, g.shape[1], self.n_inputs_hw))
+            return True
+        except (OSError, KeyError, ValueError, IndexError, TypeError) as e:
+            print("  --> ERROR: ICE gain file not loaded ({})".format(e))
+            return False
+
+    def _load_crs_gains(self):
+        """CRS .npy, (8, n_freq_full) or transposed, in FPGA bit-reversed bin order."""
+        flb, fub = self.fbounds
+        try:
+            if self.Gain_Directory is None or os.path.isdir(self.Gain_Directory):
+                raise ValueError("for CRS, Gain_Directory must be the .npy gain file for this "
+                                 "acquisition (e.g. gaindir = gdir + '<file>.npy')")
+            self.gainfile = os.path.basename(self.Gain_Directory)
+            g = np.load(self.Gain_Directory, allow_pickle=True)
+            n_full = self.n_freq_full
+            if g.shape == (self.n_inputs_hw, n_full):
+                g = g.T
+            elif g.shape != (n_full, self.n_inputs_hw):
+                raise ValueError("CRS gain array has shape {}, expected ({}, {})".format(
+                    g.shape, self.n_inputs_hw, n_full))
+            if n_full != 8192:
+                raise ValueError("CRS bin descrambling assumes 8192 channels, data has "
+                                 "{}".format(n_full))
+            f_nat = np.arange(n_full)
+            f_rev = (f_nat >> 11) | ((f_nat & 0b11111111111) << 2)
+            bin_map = (f_rev & 0b1111111111100) | ((f_rev + f_nat) & 0b11)
+            self.gain = np.real(g[bin_map, :])[flb:fub, :]
+            print("  --> Gains: loaded {}".format(self.gainfile))
+            return True
+        except (OSError, ValueError) as e:
+            print("  --> ERROR: CRS gain file not loaded ({})".format(e))
+            return False
+
+    ############################################################
+    # PER-FILE PROCESSING
+    ############################################################
+    def _read_file(self, fd):
+        """(channels (t,f,n_channels) complex, UNIX times, sat (t,f,n_ports) or None).
+        Gains divided out (if Apply_Gains) and conjugation done so each channel
+        matches its name. Offsets are NOT applied here."""
+        vis = self._read_vis(fd)
+        chans = vis[:, :, self.chan_raw_idx]
+        if self.Apply_Gains:
+            ga = self.gain[:, self.chan_ports[:, 0]]
+            gb = self.gain[:, self.chan_ports[:, 1]]
+            chans /= (ga * gb)[np.newaxis, :, :]
+        if self.chan_conj.any():
+            chans[:, :, self.chan_conj] = np.conj(chans[:, :, self.chan_conj])
+        tm = self._read_times(fd)
+        sat = None
+        if 'sat' in fd and self._layout == 'tfp':
+            flb, fub = self.fbounds
+            try:
+                sat = np.real(np.array(fd['sat'][:, flb:fub, :]))[:, :, self.automap]
+            except (ValueError, IndexError):
+                sat = None
+        return chans, tm, sat
+
+    def _compute_offsets(self, filelist, offset_file_index, offset_time_samples):
+        if len(self.cross_idx) == 0:
+            print("  --> Offset removal: no cross channels, nothing to do.")
+            return
+        offset_file = filelist[offset_file_index]
+        with h5py.File(os.path.join(self.Data_Directory, offset_file), 'r') as fd:
+            chans, _, _ = self._read_file(fd)
+        n_use = min(offset_time_samples, chans.shape[0])
+        cross = chans[:n_use, :, self.cross_idx]
+        self.offset_real = np.median(cross.real, axis=0)    # (freq, n_cross) = V_cross order
+        self.offset_imag = np.median(cross.imag, axis=0)
+        self._offset = self.offset_real + 1j * self.offset_imag
+        self.offset_file = offset_file
+        self.offset_n_samples = n_use
+        print("  --> Offset removal: median real/imag of the first {} integrations of {} "
+              "subtracted from {}; autos untouched.".format(
+                  n_use, offset_file, _plural(len(self.cross_idx), 'cross channel')))
+
+    def _check_autos(self):
+        """Mapping sanity check: autos must come out real."""
+        if len(self.auto_idx) == 0 or len(self.t) == 0:
+            return
+        sub = self.V[:min(200, len(self.t)), :, self.auto_idx]
+        re_max = np.nanmax(np.abs(sub.real), axis=(0, 1))
+        im_max = np.nanmax(np.abs(sub.imag), axis=(0, 1))
+        for k, r, im in zip(self.auto_idx, re_max, im_max):
+            if r > 0 and im / r > 1e-3:
+                print("  --> WARNING: auto channel {} '{}' has |imag|/|real| up to {:.2g}; "
+                      "autos should be real. Check chmap / instrument.".format(
+                          k, self.chnames[int(k)], im / r))
+
+    ############################################################
+    # USER-FACING HELPERS
+    ############################################################
+    @property
+    def V_auto(self):
+        """Auto channels only, (time, freq, n_auto). Index k here = auto_names[k];
+        V index = auto_idx[k]. Built once on first use (a copy of those channels)."""
+        if 'V_auto' not in self._cache:
+            self._cache['V_auto'] = self.V[:, :, self.auto_idx]
+        return self._cache['V_auto']
+
+    @property
+    def V_cross(self):
+        """Cross channels only, (time, freq, n_cross). Index k here = cross_names[k];
+        V index = cross_idx[k]. Built once on first use (a copy of those channels)."""
+        if 'V_cross' not in self._cache:
+            self._cache['V_cross'] = self.V[:, :, self.cross_idx]
+        return self._cache['V_cross']
+
+    def _resolve_port(self, token):
+        """keystring ('Ref'), labelled port ('Ref(1)') or port number (1 / '1') -> port."""
+        if isinstance(token, (int, np.integer)):
+            p = int(token)
+        else:
+            s = str(token).strip()
+            m = re.fullmatch(r'(.*?)\s*\(\s*(\d+)\s*\)', s)
+            if m:
+                p = int(m.group(2))
+                if m.group(1) and p in self.chmap:
+                    k = self.keystrings[int(np.where(self.chmap == p)[0][0])]
+                    if m.group(1) != k:
+                        raise KeyError("Port {} is '{}', not '{}'".format(p, k, m.group(1)))
+            elif s.isdigit():
+                p = int(s)
+            else:
+                hits = [int(pp) for pp, k in zip(self.chmap, self.keystrings) if k == s]
+                if not hits:
+                    raise KeyError("'{}' isn't a keystring. Used ports: {}".format(
+                        s, ', '.join(self.port_labels)))
+                if len(hits) > 1:
+                    raise KeyError("'{}' matches ports {}; use e.g. '{}({})'".format(
+                        s, hits, s, hits[0]))
+                p = hits[0]
+        if p not in self.chmap:
+            raise KeyError("Port {} isn't a used port. Used ports: {}".format(
+                p, ', '.join(self.port_labels)))
+        return p
+
+    def _v_index(self, a, b=None):
+        """(V index, conj needed for the requested order)."""
+        if b is None:
+            if isinstance(a, (int, np.integer)):
+                idx = int(a)
+                if not -self.n_channels <= idx < self.n_channels:
+                    raise IndexError("V channel {} out of range (0-{})".format(
+                        idx, self.n_channels - 1))
+                return idx % self.n_channels, False
+            parts = _X_SPLIT.split(str(a).strip())
+            if len(parts) != 2:
+                if len(parts) == 1:          # one port -> its auto
+                    a = b = parts[0]
+                else:
+                    raise KeyError("Give a channel as 'A x B', two ports, or an index; "
+                                   "got {!r}".format(a))
+            else:
+                a, b = parts
+        pa, pb = self._resolve_port(a), self._resolve_port(b)
+        for k, (x, y) in enumerate(self.chan_ports):
+            if x == pa and y == pb:
+                return k, False
+            if x == pb and y == pa:
+                return k, True
+        raise KeyError("No channel for ports {} x {}".format(pa, pb))
+
+    def chan_index(self, a, b=None, array='V', return_conj=False):
+        """Index of a channel in V (default), 'V_auto' or 'V_cross'.
+            chan_index(4)                          V index 4 (checked)
+            chan_index('Ref(1) x Dish(3)')         by name
+            chan_index('Ref', 'Dish')              keystrings / 'Ref(1)' / port numbers
+            chan_index('Ref')                      the Ref auto
+            chan_index('Ref', 'Dish', array='V_cross')   its index in V_cross
+        A request for B x A of a channel stored as A x B returns that channel;
+        with return_conj=True you also get True = your order is its conjugate."""
+        k, c = self._v_index(a, b)
+        array = str(array)
+        if array == 'V_auto':
+            if not self.chan_is_auto[k]:
+                raise KeyError("'{}' is a cross, not in V_auto".format(self.chnames[k]))
+            k = int(self.chan_sub_idx[k])
+        elif array == 'V_cross':
+            if self.chan_is_auto[k]:
+                raise KeyError("'{}' is an auto, not in V_cross".format(self.chnames[k]))
+            k = int(self.chan_sub_idx[k])
+        elif array != 'V':
+            raise ValueError("array must be 'V', 'V_auto' or 'V_cross'")
+        return (k, c) if return_conj else k
+
+    def auto_index(self, a):
+        """Index in V_auto of a port's auto."""
+        return self.chan_index(a, array='V_auto')
+
+    def cross_index(self, a, b=None):
+        """Index in V_cross of a cross channel."""
+        return self.chan_index(a, b, array='V_cross')
+
+    def get_chan(self, a, b=None):
+        """Complex data (time, freq) of one channel in exactly the order asked."""
+        k, c = self._v_index(a, b)
+        return np.conj(self.V[:, :, k]) if c else self.V[:, :, k]
+
+    def magnitude(self, a, b=None):
+        """np.abs() of one channel (time, freq) - right for autos and crosses."""
+        return np.abs(self.V[:, :, self._v_index(a, b)[0]])
+
+    def is_auto(self, a, b=None):
+        return bool(self.chan_is_auto[self._v_index(a, b)[0]])
+
+    def print_channels(self):
+        """Table of every channel: V index, V_auto / V_cross index, name, ports, ..."""
+        tab = self.channel_table
+        show_dish = any(d is not None for d in tab['dish_a'])
+        hdr = ['V', 'V_auto', 'V_cross', 'name', 'type', 'ports'] + (['dishes'] if show_dish else [])
+        rows = []
+        for k, r in tab.iterrows():
+            row = [str(k),
+                   '' if pandas.isna(r['V_auto']) else str(r['V_auto']),
+                   '' if pandas.isna(r['V_cross']) else str(r['V_cross']),
+                   r['name'], r['type'], '{} x {}'.format(r['port_a'], r['port_b'])]
+            if show_dish:
+                row.append(str(r['dish_a']) if r['dish_a'] == r['dish_b']
+                           else '{} x {}'.format(r['dish_a'], r['dish_b']))
+            rows.append(row)
+        w = [max(len(h), *(len(r[c]) for r in rows)) for c, h in enumerate(hdr)]
+        line = '  '.join('{:<%d}' % x for x in w)
+        print('{} channels from the {} ({}, {}). Use np.abs() for magnitudes:'
+              .format(self.n_channels, INSTRUMENT_LONGNAME[self.instrument],
+                      _plural(len(self.auto_idx), 'auto'), _plural(len(self.cross_idx), 'cross')))
+        print('  ' + line.format(*hdr))
+        print('  ' + '  '.join('-' * x for x in w))
+        for r in rows:
+            print('  ' + line.format(*r))

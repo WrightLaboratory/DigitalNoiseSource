@@ -3,13 +3,11 @@ flight_info:
     cdats: ['drone_flight7_NWgrid_NEpol_42db_jul2_1900','drone_flight8_NWgrid_NWpol_42db_jul2_1930','drone_flight9_NEgrid_NEpol_42db_jul2_2000','drone_flight10_NEgrid_NWpol_42db_jul2_2030']
     desc: ['NW','NW','NE','NE']
     pols: ['NE','NW','NE','NW']
-    fmins: [?,3000]
-    fmaxes: [?,4400]
-    tlbs: [?,2450]
-    tubs: [?,11000]
-    time_correction: [?,-244.031]
-    start_freq_inds: [4000,3000]
-    stop_freq_inds: [12300,4400]
+    fmins: [?,3100,?,?]
+    fmaxes: [?,6500,?,?]
+    tlbs: [?,2450,4750,4000]
+    tubs: [?,11000,12975,12300]
+    time_correction: [?,-243.941,?,-247.130]
 
 flag_info:
     NW_pols: [2,8]
